@@ -509,13 +509,20 @@ WHERE name IN ('product_sales', 'customer_product_summary');
 
 ```bash
 # Create with deduplication enabled
-dtctl create dynamic_table product_sales \
-  --lag '5 minutes' \
-  --deduplicate \
-  --query "SELECT product_id, SUM(quantity) FROM orderlines GROUP BY product_id"
+cat > product_sales.sql <<EOF
+CREATE DYNAMIC TABLE lake.dynamic.product_sales
+TARGET_LAG = '5 minutes'
+DEDUPLICATION = true
+AS
+SELECT product_id, SUM(quantity) as total_qty
+FROM lake.orderlines
+GROUP BY product_id;
+EOF
+
+dynamic-tables create -f product_sales.sql
 
 # Enable on existing table
-dtctl alter dynamic_table product_sales --deduplicate=true
+dynamic-tables alter product_sales --set "DEDUPLICATION=true"
 ```
 
 ## Testing

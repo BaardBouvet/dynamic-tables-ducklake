@@ -77,16 +77,28 @@ FROM lake.events
 GROUP BY user_id;
 ```
 
+## Design Rationale: SQL-First
+
+**All table properties are embedded in SQL DDL, not passed as CLI flags.**
+
+Why? As we add properties (`DEDUPLICATION`, `CARDINALITY_THRESHOLD`, `PARALLEL_THRESHOLD`, etc.), CLI flags don't scale. The SQL approach:
+- ✅ Scales to any number of properties without CLI changes
+- ✅ SQL files are complete, self-documenting, version-controllable
+- ✅ Same SQL works across interfaces (CLI → DuckDB extension → REST API)
+- ✅ Matches industry patterns (Snowflake, dbt, Terraform)
+
 ## Submission Methods
 
 ### Phase 1-3: CLI Tool (Core Interface)
 
-```bash
-# Create
-dynamic-tables create -f query.sql
+The CLI accepts full `CREATE DYNAMIC TABLE` statements.
 
-# Create with deduplication
-dynamic-tables create --deduplicate -f query.sql
+```bash
+# Create from file containing CREATE DYNAMIC TABLE statement
+dynamic-tables create -f customer_metrics.sql
+
+# Create from stdin
+cat customer_metrics.sql | dynamic-tables create
 
 # List
 dynamic-tables list
@@ -94,8 +106,10 @@ dynamic-tables list
 # Describe
 dynamic-tables describe customer_metrics
 
-# Alter table to enable deduplication
-dynamic-tables alter customer_metrics --deduplicate=true
+# Alter table properties
+dynamic-tables alter customer_metrics \
+  --set "DEDUPLICATION=true" \
+  --set "TARGET_LAG='10 minutes'"
 
 # Drop
 dynamic-tables drop customer_metrics
@@ -103,44 +117,65 @@ dynamic-tables drop customer_metrics
 # Force refresh
 dynamic-tables refresh customer_metrics
 
-# Validate query without creating table
-dynamic-tables validate -f query.sql
+# Validate without creating table
+dynamic-tables validate -f customer_metrics.sql
 ```
+
+**Example SQL file (customer_metrics.sql):**
+```sql
+CREATE DYNAMIC TABLE lake.dynamic.customer_metrics
+TARGET_LAG = '5 minutes'
+DEDUPLICATION = true
+AS
+SELECT customer_id, COUNT(*) as order_count, SUM(amount) as total
+FROM lake.orders
+GROUP BY customer_id;
+```
+
+**Why this design:**
+- ✅ No CLI flags needed for table properties (scalable as we add more properties)
+- ✅ SQL file is complete, self-documenting
+- ✅ Can copy/paste directly into DuckDB extension later (future compatibility)
+- ✅ Validation can analyze full CREATE statement
+- ❌ More verbose than just SELECT query (but worth it for consistency)
 
 ### Validation Mode
 
-The `validate` command checks a query without creating the dynamic table:
+The `validate` command checks the CREATE DYNAMIC TABLE statement without actually creating the table:
 
 ```bash
 # Validate from file
 dynamic-tables validate -f customer_metrics.sql
 
 # Validate from stdin
-echo "SELECT customer_id, COUNT(*) FROM orders GROUP BY customer_id" | \
-  dynamic-tables validate
+cat customer_metrics.sql | dynamic-tables validate
 
 # JSON output for programmatic use
-dynamic-tables validate -f query.sql --format json
+dynamic-tables validate -f customer_metrics.sql --format json
 ```
 
 **What validation checks:**
 
-✅ **SQL syntax**: Query parses successfully  
+✅ **DDL syntax**: CREATE DYNAMIC TABLE statement parses successfully  
+✅ **Query syntax**: AS SELECT portion is valid SQL  
 ✅ **Source tables exist**: All referenced tables are accessible  
-✅ **GROUP BY extraction**: Can identify grouping columns  
+✅ **GROUP BY extraction**: Can identify grouping columns (if using AFFECTED_KEYS)  
 ✅ **Strategy detection**: Determines refresh strategy (AFFECTED_KEYS vs FULL)  
+✅ **Property validation**: TARGET_LAG format, thresholds in valid ranges  
 ✅ **Unsupported features**: Catches known limitations  
 
 **Example validation output:**
 
 ```
+✓ DDL syntax valid
 ✓ Query syntax valid
 ✓ Source tables: orders, customers (both exist)
 ✓ Refresh strategy: AFFECTED_KEYS
 ✓ GROUP BY columns: customer_id
 ✓ Dependencies: orders, customers
+✓ Properties: TARGET_LAG='5 minutes', DEDUPLICATION=true
 
-Ready to create dynamic table.
+Ready to create dynamic table 'customer_metrics'.
 ```
 
 **Failed validation example:**
@@ -148,7 +183,8 @@ Ready to create dynamic table.
 ```
 ✗ Source table not found: nonexistent_table
 ✗ Unsupported feature: Window function without PARTITION BY
-  Line 3: ROW_NUMBER() OVER ()
+  Line 5: ROW_NUMBER() OVER ()
+✗ Invalid property: TARGET_LAG='invalid_value'
 
 Cannot create dynamic table.
 ```
@@ -158,12 +194,18 @@ Cannot create dynamic table.
 ```json
 {
   "valid": true,
+  "table_name": "customer_metrics",
   "syntax_ok": true,
   "source_tables": ["orders", "customers"],
   "all_sources_exist": true,
   "refresh_strategy": "AFFECTED_KEYS",
   "group_by_columns": ["customer_id"],
   "dependencies": ["orders", "customers"],
+  "properties": {
+    "target_lag": "5 minutes",
+    "deduplication": true,
+    "cardinality_threshold": 0.3
+  },
   "warnings": [],
   "errors": []
 }
@@ -176,7 +218,8 @@ Cannot create dynamic table.
   "valid": false,
   "errors": [
     "Source table 'nonexistent' not found",
-    "Unsupported: Window function without PARTITION BY"
+    "Unsupported: Window function without PARTITION BY",
+    "Invalid TARGET_LAG value: 'invalid_value'"
   ],
   "warnings": [
     "Large join detected - consider CARDINALITY_THRESHOLD tuning"
@@ -187,8 +230,8 @@ Cannot create dynamic table.
 **Use cases:**
 
 - **Pre-deployment checks**: Validate in CI/CD before deployment
-- **Development**: Test queries before committing to CREATE
-- **Documentation**: Generate metadata about what a query does
+- **Development**: Test complete DDL before committing to CREATE
+- **Documentation**: Generate metadata about table definition
 - **Troubleshooting**: Understand why CREATE might fail
 ```
 
@@ -294,3 +337,236 @@ REFRESH_STRATEGY = 'FULL'
 AS
 SELECT * FROM orders WHERE complex_conditions(...);
 ```
+## Implementation: Parsing CREATE DYNAMIC TABLE
+
+The CLI parses the full SQL statement to extract table metadata and query.
+
+### Using sqlglot
+
+```python
+import sqlglot
+from sqlglot import exp
+from typing import Dict, Any
+
+def parse_dynamic_table_ddl(sql: str) -> Dict[str, Any]:
+    """
+    Parse CREATE DYNAMIC TABLE statement.
+    
+    Returns:
+        {
+            'table_name': str,
+            'query': str,  # The AS SELECT ... portion
+            'properties': {
+                'target_lag': str,
+                'deduplication': bool,
+                'refresh_strategy': str,
+                'cardinality_threshold': float,
+                # ... other properties
+            }
+        }
+    """
+    # Parse SQL
+    statements = sqlglot.parse(sql, dialect='duckdb')
+    if not statements:
+        raise ValueError("No SQL statement found")
+    
+    stmt = statements[0]
+    
+    # Check for CREATE DYNAMIC TABLE pattern
+    if not isinstance(stmt, exp.Create):
+        raise ValueError("Expected CREATE statement")
+    
+    # Extract table name
+    table_name = stmt.this.sql()
+    
+    # Extract properties (between CREATE ... and AS)
+    properties = {}
+    for prop in stmt.args.get('properties', []):
+        key = prop.name.lower()
+        value = prop.value
+        
+        if key == 'target_lag':
+            properties['target_lag'] = value.this  # String literal
+        elif key == 'deduplication':
+            properties['deduplication'] = value.this.lower() == 'true'
+        elif key == 'refresh_strategy':
+            properties['refresh_strategy'] = value.this.upper()
+        elif key == 'cardinality_threshold':
+            properties['cardinality_threshold'] = float(value.this)
+        elif key == 'parallel_threshold':
+            properties['parallel_threshold'] = int(value.this)
+        elif key == 'max_parallelism':
+            properties['max_parallelism'] = int(value.this)
+    
+    # Extract query (the AS SELECT portion)
+    query = stmt.expression.sql(dialect='duckdb')
+    
+    return {
+        'table_name': table_name,
+        'query': query,
+        'properties': properties
+    }
+```
+
+### Alternative: Simple Regex Parser
+
+For Phase 1, a simple regex-based parser may be sufficient:
+
+```python
+import re
+from typing import Dict, Any
+
+def parse_dynamic_table_simple(sql: str) -> Dict[str, Any]:
+    """Simple regex-based parser for CREATE DYNAMIC TABLE."""
+    
+    # Extract table name
+    table_match = re.search(
+        r'CREATE\s+DYNAMIC\s+TABLE\s+([^\s]+)',
+        sql,
+        re.IGNORECASE
+    )
+    if not table_match:
+        raise ValueError("Invalid CREATE DYNAMIC TABLE syntax")
+    table_name = table_match.group(1)
+    
+    # Extract AS query
+    as_match = re.search(r'\bAS\b\s+(SELECT\b.+)', sql, re.IGNORECASE | re.DOTALL)
+    if not as_match:
+        raise ValueError("Missing AS SELECT clause")
+    query = as_match.group(1).strip()
+    
+    # Extract properties
+    properties = {}
+    
+    # TARGET_LAG
+    lag_match = re.search(r"TARGET_LAG\s*=\s*'([^']+)'", sql, re.IGNORECASE)
+    if lag_match:
+        properties['target_lag'] = lag_match.group(1)
+    
+    # DEDUPLICATION
+    dedup_match = re.search(r'DEDUPLICATION\s*=\s*(true|false)', sql, re.IGNORECASE)
+    if dedup_match:
+        properties['deduplication'] = dedup_match.group(1).lower() == 'true'
+    
+    # REFRESH_STRATEGY
+    strategy_match = re.search(r"REFRESH_STRATEGY\s*=\s*'([^']+)'", sql, re.IGNORECASE)
+    if strategy_match:
+        properties['refresh_strategy'] = strategy_match.group(1).upper()
+    
+    # CARDINALITY_THRESHOLD
+    threshold_match = re.search(r'CARDINALITY_THRESHOLD\s*=\s*([0-9.]+)', sql, re.IGNORECASE)
+    if threshold_match:
+        properties['cardinality_threshold'] = float(threshold_match.group(1))
+    
+    return {
+        'table_name': table_name,
+        'query': query,
+        'properties': properties
+    }
+```
+
+### CLI create Command Implementation
+
+```python
+def create_command(args):
+    """Handle 'dynamic-tables create -f file.sql'"""
+    
+    # Read SQL file
+    with open(args.file, 'r') as f:
+        sql = f.read()
+    
+    # Parse DDL
+    parsed = parse_dynamic_table_ddl(sql)
+    
+    # Validate
+    validate_dynamic_table(
+        query=parsed['query'],
+        properties=parsed['properties']
+    )
+    
+    # Insert into metadata
+    conn = connect_metadata_db()
+    conn.execute("""
+        INSERT INTO dynamic_tables (
+            name, query, target_lag, deduplication, 
+            refresh_strategy, cardinality_threshold,
+            created_at, last_refresh
+        ) VALUES (?, ?, ?, ?, ?, ?, NOW(), NULL)
+    """, (
+        parsed['table_name'],
+        parsed['query'],
+        parsed['properties'].get('target_lag', '5 minutes'),
+        parsed['properties'].get('deduplication', False),
+        parsed['properties'].get('refresh_strategy'),
+        parsed['properties'].get('cardinality_threshold', 0.3)
+    ))
+    
+    print(f"✓ Created dynamic table: {parsed['table_name']}")
+```
+
+### ALTER Command Implementation
+
+For modifying properties without rewriting query:
+
+```bash
+# Change multiple properties
+dynamic-tables alter customer_metrics \
+  --set "DEDUPLICATION=true" \
+  --set "TARGET_LAG='10 minutes'" \
+  --set "CARDINALITY_THRESHOLD=0.5"
+```
+
+```python
+def alter_command(args):
+    """Handle 'dynamic-tables alter <table> --set <prop=value>'"""
+    
+    conn = connect_metadata_db()
+    
+    for setting in args.set:
+        # Parse setting (e.g., "DEDUPLICATION=true")
+        key, value = setting.split('=', 1)
+        key = key.strip().lower()
+        value = value.strip()
+        
+        # Remove quotes if present
+        if value.startswith("'") and value.endswith("'"):
+            value = value[1:-1]
+        
+        # Build UPDATE based on property type
+        if key == 'deduplication':
+            conn.execute(
+                "UPDATE dynamic_tables SET deduplication = ? WHERE name = ?",
+                (value.lower() == 'true', args.table)
+            )
+        elif key == 'target_lag':
+            conn.execute(
+                "UPDATE dynamic_tables SET target_lag = ? WHERE name = ?",
+                (value, args.table)
+            )
+        # ... handle other properties
+        
+        print(f"✓ Updated {key} = {value}")
+```
+
+## Benefits of This Approach
+
+**✅ Scalability:**
+- Add new table properties without changing CLI interface
+- Just update parser and metadata schema
+
+**✅ SQL-First:**
+- SQL files are complete, self-documenting
+- Can version control full table definitions
+- Easy migration to DuckDB extension later
+
+**✅ Validation:**
+- Can validate complete CREATE statement before submitting
+- Catch property errors early
+
+**✅ Developer Experience:**
+- Familiar SQL syntax (matches Snowflake)
+- Copy/paste between different interfaces (CLI, extension, API)
+
+**✅ Migration Path:**
+- Same SQL works in CLI (Phase 1-3) and DuckDB extension (Phase 4+)
+- Users can switch interfaces without rewriting DDL

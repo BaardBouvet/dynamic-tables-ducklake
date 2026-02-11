@@ -74,7 +74,8 @@ Snowflake-style dynamic tables on DuckLake with automatic incremental refresh an
 
 ```bash
 # Phase 1: Create dynamic table via CLI
-dynamic-tables create -f query.sql
+# (SQL file contains full CREATE DYNAMIC TABLE statement)
+dynamic-tables create -f customer_metrics.sql
 
 # Phase 2: Incremental refresh runs automatically
 # (detects changes via CDC, recomputes only affected keys)
@@ -84,6 +85,10 @@ docker run -d dynamic-tables-worker \
   --pg-url postgresql://... \
   --duckdb-path /data/lake.db
 ```
+
+See [examples/](examples/) directory for complete SQL examples.
+
+
 
 ## SQL Example
 
