@@ -49,26 +49,26 @@ Snowflake-style dynamic tables on DuckLake with automatic incremental refresh an
 
 ## Documentation
 
-**Core System (Phases 1-3):**
+**Core System Design (Phases 1-3 - Single Worker):**
 
 1. [Overview](docs/01-overview.md) - Architecture and components
 2. [Affected Keys Strategy](docs/02-affected-keys-strategy.md) - Incremental refresh algorithm
-3. [Snapshot Isolation](docs/03-snapshot-isolation.md) - Consistency guarantees
-5. [Testing Strategy](docs/05-testing-strategy.md) - TDD approach and test cases
-6. [SQL Interface](docs/06-sql-interface.md) - DDL syntax and submission methods
-7. [Metadata Schema](docs/07-metadata-schema.md) - PostgreSQL tables (4 core tables)
-8. [Implementation Phases](docs/08-implementation-phases.md) - Development roadmap
+3. [Snapshot Isolation](docs/03-snapshot-isolation.md) - Consistency guarantees and query rewriting
+5. [Testing Strategy](docs/05-testing-strategy.md) - TDD approach and comprehensive test cases
+6. [SQL Interface](docs/06-sql-interface.md) - DDL syntax, validation, and submission methods
+7. [Metadata Schema](docs/07-metadata-schema.md) - PostgreSQL tables (4 core tables for single worker)
+8. [Implementation Phases](docs/08-implementation-phases.md) - Development roadmap and detailed requirements
 9. [Multi-Table Joins](docs/09-multi-table-joins.md) - Handling N-way joins and runtime cardinality
 10. [Transactions & Consistency](docs/10-transactions-consistency.md) - Transactional refresh guarantees
 11. [Performance Considerations](docs/11-performance-considerations.md) - Why SQL-first approach is fast
-12. [Deduplication Strategy](docs/12-deduplication-strategy.md) - Avoid unnecessary writes (Phase 3 optimization)
+12. [Deduplication Strategy](docs/12-deduplication-strategy.md) - Avoid unnecessary writes with cost analysis
 13. [Large Cardinality Handling](docs/13-large-cardinality-handling.md) - Out-of-core processing for huge affected key sets
-15. [Worker Configuration](docs/15-worker-configuration.md) - Database connections, CLI args, deployment options
+15. [Worker Configuration](docs/15-worker-configuration.md) - Database connections, CLI args, validation, deployment options
 
-**Future Enhancements (Phase 4):**
+**Future Enhancements (Phase 4 - Distributed/Multi-Worker):**
 
-4. [Multi-Worker Architecture](docs/04-multi-worker-architecture.md) - Kubernetes scaling and coordination
-14. [Parallel Single-Table Refresh](docs/14-parallel-single-table-refresh.md) - Distribute one refresh across workers
+4. [Multi-Worker Architecture](docs/04-multi-worker-architecture.md) - Kubernetes scaling and coordination (if needed for >500 tables)
+14. [Parallel Single-Table Refresh](docs/14-parallel-single-table-refresh.md) - Distribute one refresh across workers (for extreme scale)
 
 ## Quick Start
 

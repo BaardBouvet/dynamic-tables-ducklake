@@ -22,9 +22,12 @@ CREATE TABLE refresh_history (...);
 
 **Tests**:
 - Parse `CREATE DYNAMIC TABLE` DDL
+- **Validate DDL before creation**: Syntax, source tables exist, unsupported features
+- **Circular dependency detection**: Reject cycles at CREATE time
 - Store/retrieve table metadata
 - Single worker polls and processes work
 - **Initial load does full refresh without CDC (bootstrap)**
+- **Bootstrap snapshot timing**: Capture snapshots BEFORE query execution
 - **Bootstrap respects dependency order (A→B→C processed in sequence)**
 - Dependency chains processed in same iteration (A→B→C all refreshed in one loop)
 - Full refresh updates materialized table
@@ -34,10 +37,14 @@ CREATE TABLE refresh_history (...);
 **Implementation**:
 - PostgreSQL metadata schema (4 core tables - see [Metadata Schema](07-metadata-schema.md#core-tables-phases-1-3))
 - DDL parser using `sqlglot`
+- **DDL validation**: Verify syntax, sources exist, extract GROUP BY
+- **Circular dependency prevention**: Topological sort validation before CREATE
+- **Configuration management**: CLI args, environment variables, validation
 - Simple polling loop: query `dynamic_tables`, check `target_lag`, refresh if needed
 - Full refresh execution (TRUNCATE + INSERT)
-- CLI tool: `create`, `list`, `describe`, `drop`
+- CLI tool: `create`, `list`, `describe`, `drop`, **`validate`**
 - DuckDB + DuckLake connection setup
+- **Startup validation**: Database connectivity, config sanity checks
 - Basic logging
 
 **Worker Logic:**
@@ -60,10 +67,17 @@ def refresh_table_full(table):
     
     if not snapshots:
         # BOOTSTRAP: No prior snapshots, initial load
+        # CRITICAL: Capture snapshots BEFORE running query
+        source_tables = get_source_tables(table.name)
+        snapshot_map = {src: get_current_snapshot(src) for src in source_tables}
+        
         # Just run query and insert - no CDC needed
         # BUT still processed in topological order by outer loop
         execute(f"INSERT INTO {table.name} {table.query_sql}")
-        record_current_snapshots(table.name)  # Save for next time
+        
+        # Record the snapshots we actually used
+        for src, snap in snapshot_map.items():
+            record_source_snapshot(table.name, src, snap)
     else:
         # Regular full refresh (Phase 1 always does full)
         execute(f"TRUNCATE {table.name}")
@@ -100,11 +114,14 @@ If you have: `source → A → B → C` (all new dynamic tables)
 
 **Implementation**:
 - Query analyzer (extract GROUP BY via `sqlglot`)
+- **Query rewriting for snapshot isolation** (inject `FOR SYSTEM_TIME AS OF SNAPSHOT` clauses)
+- **AST manipulation** using sqlglot for safe query modification
 - **Bootstrap detection (no source_snapshots = initial load)**
 - DuckLake CDC integration (`table_changes()`)
 - Key extraction from preimage/postimage
 - Affected keys refresh logic (using TEMP tables)
 - Cardinality-based strategy selection (runtime count, no fact/dimension classification)
+- **Cardinality threshold tuning** per table
 - N-way join handling (any number of upstream tables)
 - Source snapshot tracking for consistency
 
@@ -128,14 +145,18 @@ If you have: `source → A → B → C` (all new dynamic tables)
 - Graceful shutdown cleans up in-progress work
 
 **Implementation**:
-- Error handling and retry logic
+- Error handling and retry logic with exponential backoff
+- **Schema change detection** and graceful failure
+- **Partial chain failure handling** (if B fails in A→B→C, skip C)
 - Snapshot isolation (FOR SYSTEM_TIME AS OF SNAPSHOT)
 - Dependency graph and topological ordering (critical for same-iteration chains)
+- **Downstream lag implementation** (refresh when ANY parent refreshes)
 - Deduplication support (opt-in via `DEDUPLICATION = true`)
+- **Monitoring metrics**: refresh_duration, cardinality_ratio, dedup_ratio, lag_seconds, failures
 - Prometheus metrics exporter
 - Transaction consistency guarantees
 - Basic monitoring dashboards (Grafana)
-- Alerting rules (refresh failures, staleness)
+- Alerting rules (refresh failures, staleness, lag violations)
 - Docker containerization
 - Documentation and runbook
 
@@ -159,6 +180,166 @@ def find_tables_needing_refresh_topological():
 **Deliverable**: Production-ready single-worker system
 
 **Scope**: One worker process, robust and observable. Suitable for production use at small-medium scale (<100 dynamic tables, <10TB data).
+
+### Monitoring Metrics Specification (Phase 3)
+
+**Core Metrics:**
+
+```python
+# Refresh performance
+dynamic_table_refresh_duration_seconds{table, strategy}
+  # Histogram: How long refreshes take
+  # Labels: table name, strategy (FULL, AFFECTED_KEYS)
+
+dynamic_table_refresh_total{table, status}
+  # Counter: Total refreshes attempted
+  # Labels: table name, status (SUCCESS, FAILED, SKIPPED)
+
+# Staleness tracking
+dynamic_table_lag_seconds{table}
+  # Gauge: How stale is table (time since last successful refresh)
+  # Alert when: lag > target_lag * 2
+
+dynamic_table_target_lag_seconds{table}
+  # Gauge: Configured target lag for comparison
+
+# Incremental refresh metrics
+dynamic_table_affected_keys_count{table}
+  # Histogram: Number of affected keys per refresh
+  
+dynamic_table_cardinality_ratio{table}
+  # Histogram: Ratio of affected/total rows (strategy selection)
+
+# Deduplication metrics  
+dynamic_table_dedup_ratio{table}
+  # Histogram: Ratio of rows skipped due to no change
+  # Only recorded when deduplication enabled
+
+dynamic_table_rows_changed{table}
+  # Histogram: Actual rows written after deduplication
+
+# Error tracking
+dynamic_table_errors_total{table, error_type}
+  # Counter: Errors by type (schema_change, query_error, timeout, etc.)
+
+# Worker health
+dynamic_table_worker_health
+  # Gauge: 1 if healthy, 0 if unhealthy
+  
+dynamic_table_poll_duration_seconds
+  # Histogram: Time to poll metadata and find work
+```
+
+**Prometheus Alerting Rules:**
+
+```yaml
+groups:
+  - name: dynamic_tables
+    interval: 60s
+    rules:
+      # Lag violations
+      - alert: DynamicTableLagging
+        expr: |
+          dynamic_table_lag_seconds{} > 
+          dynamic_table_target_lag_seconds{} * 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dynamic table {{ $labels.table }} lagging behind target"
+          description: "Lag is {{ $value }}s, target is {{ $labels.target_lag }}s"
+      
+      # Refresh failures
+      - alert: DynamicTableRefreshFailing
+        expr: |
+          increase(dynamic_table_refresh_total{status="FAILED"}[15m]) > 3
+        labels:
+          severity: critical
+        annotations:
+          summary: "Dynamic table {{ $labels.table }} failing to refresh"
+          description: "{{ $value }} refresh failures in last 15 minutes"
+      
+      # High dedup opportunity
+      - alert: HighDedupOpportunity
+        expr: |
+          avg_over_time(dynamic_table_dedup_ratio{}[7d]) > 0.5
+          and on(table) dynamic_table_deduplication_enabled{} == 0
+        labels:
+          severity: info
+        annotations:
+          summary: "Consider enabling deduplication for {{ $labels.table }}"
+          description: "Average dedup ratio: {{ $value }}"
+      
+      # Low dedup efficiency
+      - alert: LowDedupEfficiency
+        expr: |
+          avg_over_time(dynamic_table_dedup_ratio{}[7d]) < 0.15
+          and on(table) dynamic_table_deduplication_enabled{} == 1
+        labels:
+          severity: info
+        annotations:
+          summary: "Consider disabling deduplication for {{ $labels.table }}"
+          description: "Average dedup ratio: {{ $value }} (low benefit)"
+      
+      # Worker down
+      - alert: DynamicTableWorkerDown
+        expr: dynamic_table_worker_health == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Dynamic table worker is unhealthy"
+```
+
+**Grafana Dashboard Panels:**
+
+```json
+{
+  "panels": [
+    {
+      "title": "Refresh Duration by Table",
+      "type": "graph",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, dynamic_table_refresh_duration_seconds_bucket{})"
+        }
+      ]
+    },
+    {
+      "title": "Table Lag vs Target",
+      "type": "graph",
+      "targets": [
+        {
+          "expr": "dynamic_table_lag_seconds{}",
+          "legendFormat": "{{ table }} actual"
+        },
+        {
+          "expr": "dynamic_table_target_lag_seconds{}",
+          "legendFormat": "{{ table }} target"
+        }
+      ]
+    },
+    {
+      "title": "Strategy Distribution",
+      "type": "pie",
+      "targets": [
+        {
+          "expr": "sum by(strategy) (increase(dynamic_table_refresh_total{}[1h]))"
+        }
+      ]
+    },
+    {
+      "title": "Deduplication Efficiency",
+      "type": "graph",
+      "targets": [
+        {
+          "expr": "dynamic_table_dedup_ratio{}"
+        }
+      ]
+    }
+  ]
+}
+```
 
 ---
 

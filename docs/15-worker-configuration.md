@@ -199,6 +199,92 @@ def initialize_duckdb(args):
     return conn
 ```
 
+## Configuration Validation
+
+The worker validates configuration on startup to fail fast with clear errors:
+
+```python
+def validate_configuration(args):
+    """Validate configuration before starting worker."""
+    errors = []
+    
+    # Check PostgreSQL connection
+    try:
+        pg_conn = psycopg2.connect(args.pg_url)
+        pg_conn.close()
+    except Exception as e:
+        errors.append(f"PostgreSQL connection failed: {e}")
+    
+    # Check DuckDB path
+    if args.duckdb_path != ':memory:':
+        duckdb_dir = os.path.dirname(args.duckdb_path)
+        if not os.path.exists(duckdb_dir):
+            errors.append(f"DuckDB directory does not exist: {duckdb_dir}")
+        if not os.access(duckdb_dir, os.W_OK):
+            errors.append(f"DuckDB directory not writable: {duckdb_dir}")
+    
+    # Check DuckDB can connect
+    try:
+        duck_conn = duckdb.connect(args.duckdb_path)
+        duck_conn.execute("INSTALL ducklake")
+        duck_conn.execute("LOAD ducklake")
+        duck_conn.close()
+    except Exception as e:
+        errors.append(f"DuckDB initialization failed: {e}")
+    
+    # Validate poll interval
+    if args.poll_interval < 1:
+        errors.append(f"Poll interval must be >= 1 second, got {args.poll_interval}")
+    
+    # Parse DuckDB settings
+    if args.duckdb_settings:
+        for setting in args.duckdb_settings.split(';'):
+            if '=' not in setting:
+                errors.append(f"Invalid DuckDB setting format: '{setting}' (expected key=value)")
+    
+    # Report errors
+    if errors:
+        logger.error("Configuration validation failed:")
+        for error in errors:
+            logger.error(f"  - {error}")
+        sys.exit(1)
+    else:
+        logger.info("Configuration validated successfully")
+
+def main():
+    args = parse_args()
+    
+    # Validate before doing anything else
+    validate_configuration(args)
+    
+    # ... continue with worker initialization
+```
+
+**Benefits:**
+- **Fail fast**: Catch configuration errors at startup, not during first refresh
+- **Clear errors**: Specific messages about what's wrong
+- **Prevents silent failures**: Don't start worker that can't work
+
+**Example validation output:**
+
+```
+2026-02-11 10:00:00 INFO Configuration validated successfully
+2026-02-11 10:00:00 INFO PostgreSQL: postgresql://postgres:5432/metadata
+2026-02-11 10:00:00 INFO DuckDB: /data/lake.db
+2026-02-11 10:00:00 INFO DuckLake extension: loaded
+2026-02-11 10:00:00 INFO Poll interval: 60s
+2026-02-11 10:00:00 INFO Worker starting...
+```
+
+**Example validation failure:**
+
+```
+2026-02-11 10:00:00 ERROR Configuration validation failed:
+2026-02-11 10:00:00 ERROR   - PostgreSQL connection failed: could not connect to server: Connection refused
+2026-02-11 10:00:00 ERROR   - DuckDB directory not writable: /readonly/data
+2026-02-11 10:00:00 ERROR   - Invalid DuckDB setting format: 'threads8' (expected key=value)
+```
+
 ## Common Configurations
 
 **Development (laptop):**

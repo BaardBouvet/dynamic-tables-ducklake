@@ -23,16 +23,22 @@ def refresh_dynamic_table(table_name):
     
     if not snapshots:
         # BOOTSTRAP: Initial load
-        # No CDC needed - just run the query from current state
+        # CRITICAL: Capture snapshots BEFORE running query to avoid race condition
+        # If we capture after, source data might change between query and snapshot capture
+        source_tables = get_source_tables(table_name)
+        snapshot_map = {}
+        for source_table in source_tables:
+            snapshot_map[source_table] = get_current_snapshot(source_table)
+        
+        # No CDC needed - just run the query from captured snapshot state
         execute(f"""
             INSERT INTO {table_name}
             {table.query_sql}  -- Full query, no filtering
         """)
         
-        # Record current snapshots for next time
-        for source_table in get_source_tables(table_name):
-            current_snapshot = get_current_snapshot(source_table)
-            insert_source_snapshot(table_name, source_table, current_snapshot)
+        # Record the snapshots we actually used
+        for source_table, snapshot_id in snapshot_map.items():
+            insert_source_snapshot(table_name, source_table, snapshot_id)
     else:
         # Regular incremental refresh (use CDC from last snapshots)
         refresh_incremental(table_name, snapshots)
@@ -232,5 +238,69 @@ What if millions of keys are affected?
 - Persistent temp tables for extreme cases
 
 See [Large Cardinality Handling](13-large-cardinality-handling.md) for details.
+
+## Tuning Cardinality Threshold
+
+**Default (30%)** works for most cases, but consider tuning based on your workload:
+
+### When to Increase Threshold (40-60%)
+
+Use a higher threshold if:
+- **Full refresh is very expensive**: Billions of rows, complex joins, slow queries
+- **Incremental has good performance**: Indexes on GROUP BY keys, efficient key extraction
+- **Affected keys fit in memory**: No spilling overhead for key sets
+
+**Example scenario:**
+```sql
+-- 10B row table, full scan takes 5 minutes
+-- Incremental with 50% affected keys: 2.5 minutes (still faster)
+CREATE DYNAMIC TABLE huge_aggregates
+CARDINALITY_THRESHOLD = 0.6  -- Stay incremental longer
+AS SELECT ...;
+```
+
+### When to Decrease Threshold (10-20%)
+
+Use a lower threshold if:
+- **Full refresh is optimized**: Columnar compression, simple aggregation
+- **Incremental is complex**: Multi-table joins to extract keys, expensive CDC processing
+- **Large key sets cause spilling**: Memory pressure from affected_keys temp tables
+
+**Example scenario:**
+```sql
+-- Optimized columnar layout, full refresh takes 30 seconds
+-- Incremental with 15% affected keys: 25 seconds (marginal benefit)
+CREATE DYNAMIC TABLE optimized_table
+CARDINALITY_THRESHOLD = 0.15  -- Switch to full early
+AS SELECT ...;
+```
+
+### How to Measure and Tune
+
+1. **Enable timing metrics** (Phase 3):
+   ```python
+   metrics.record('refresh.duration', duration_ms)
+   metrics.record('refresh.strategy', strategy)  # FULL or AFFECTED_KEYS
+   metrics.record('refresh.cardinality_ratio', ratio)
+   ```
+
+2. **Analyze performance**:
+   ```sql
+   -- Find cases near threshold where strategy switches
+   SELECT dynamic_table, 
+          AVG(duration_ms) FILTER (WHERE strategy = 'FULL') as avg_full,
+          AVG(duration_ms) FILTER (WHERE strategy = 'AFFECTED_KEYS') as avg_incremental
+   FROM refresh_history
+   WHERE cardinality_ratio BETWEEN 0.25 AND 0.35  -- Near default threshold
+   GROUP BY dynamic_table;
+   ```
+
+3. **Adjust threshold** based on crossover point:
+   ```bash
+   # If incremental is faster even at 50% cardinality
+   dynamic-tables alter product_sales --cardinality-threshold=0.5
+   ```
+
+**Default is conservative** - favors correctness and predictable performance over maximum optimization.
 
 See [Performance Considerations](11-performance-considerations.md) for detailed analysis.

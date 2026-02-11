@@ -30,7 +30,14 @@ GROUP BY product_id;
 
 **TARGET_LAG**: Refresh frequency
 - Time interval: `'5 minutes'`, `'1 hour'`, `'1 day'`
-- Downstream: `'downstream'` (refresh when parent refreshes)
+- Downstream: `'downstream'` (refresh when ANY parent refreshes, in same iteration)
+
+**Downstream lag semantics:**
+- With **single parent**: Child refreshes whenever parent refreshes
+- With **multiple parents**: Child refreshes when ANY parent refreshes (OR logic)
+- Child refresh happens in **same iteration** as parent (not next iteration)
+- Example: If parent1 refreshes at 10:00, child also refreshes at 10:00
+- Ensures dependent tables are always up-to-date with their sources
 
 **DEDUPLICATION** (optional): Compare before writing
 - `true`: Compare old vs new aggregates, skip write if identical (default: `false`)
@@ -96,8 +103,93 @@ dynamic-tables drop customer_metrics
 # Force refresh
 dynamic-tables refresh customer_metrics
 
-# Validate
+# Validate query without creating table
 dynamic-tables validate -f query.sql
+```
+
+### Validation Mode
+
+The `validate` command checks a query without creating the dynamic table:
+
+```bash
+# Validate from file
+dynamic-tables validate -f customer_metrics.sql
+
+# Validate from stdin
+echo "SELECT customer_id, COUNT(*) FROM orders GROUP BY customer_id" | \
+  dynamic-tables validate
+
+# JSON output for programmatic use
+dynamic-tables validate -f query.sql --format json
+```
+
+**What validation checks:**
+
+✅ **SQL syntax**: Query parses successfully  
+✅ **Source tables exist**: All referenced tables are accessible  
+✅ **GROUP BY extraction**: Can identify grouping columns  
+✅ **Strategy detection**: Determines refresh strategy (AFFECTED_KEYS vs FULL)  
+✅ **Unsupported features**: Catches known limitations  
+
+**Example validation output:**
+
+```
+✓ Query syntax valid
+✓ Source tables: orders, customers (both exist)
+✓ Refresh strategy: AFFECTED_KEYS
+✓ GROUP BY columns: customer_id
+✓ Dependencies: orders, customers
+
+Ready to create dynamic table.
+```
+
+**Failed validation example:**
+
+```
+✗ Source table not found: nonexistent_table
+✗ Unsupported feature: Window function without PARTITION BY
+  Line 3: ROW_NUMBER() OVER ()
+
+Cannot create dynamic table.
+```
+
+**JSON output format:**
+
+```json
+{
+  "valid": true,
+  "syntax_ok": true,
+  "source_tables": ["orders", "customers"],
+  "all_sources_exist": true,
+  "refresh_strategy": "AFFECTED_KEYS",
+  "group_by_columns": ["customer_id"],
+  "dependencies": ["orders", "customers"],
+  "warnings": [],
+  "errors": []
+}
+```
+
+**When validation fails:**
+
+```json
+{
+  "valid": false,
+  "errors": [
+    "Source table 'nonexistent' not found",
+    "Unsupported: Window function without PARTITION BY"
+  ],
+  "warnings": [
+    "Large join detected - consider CARDINALITY_THRESHOLD tuning"
+  ]
+}
+```
+
+**Use cases:**
+
+- **Pre-deployment checks**: Validate in CI/CD before deployment
+- **Development**: Test queries before committing to CREATE
+- **Documentation**: Generate metadata about what a query does
+- **Troubleshooting**: Understand why CREATE might fail
 ```
 
 ### Future: DuckDB Extension (Recommended)
