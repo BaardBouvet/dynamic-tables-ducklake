@@ -63,6 +63,7 @@ Snowflake-style dynamic tables on DuckLake with automatic incremental refresh an
 11. [Performance Considerations](docs/11-performance-considerations.md) - Why SQL-first approach is fast
 12. [Deduplication Strategy](docs/12-deduplication-strategy.md) - Avoid unnecessary writes (Phase 3 optimization)
 13. [Large Cardinality Handling](docs/13-large-cardinality-handling.md) - Out-of-core processing for huge affected key sets
+15. [Worker Configuration](docs/15-worker-configuration.md) - Database connections, CLI args, deployment options
 
 **Future Enhancements (Phase 4):**
 
