@@ -72,11 +72,11 @@ Implement Snowflake-style dynamic tables with configurable lag on DuckLake:
 
 ## Related Documents
 
-- [Affected Keys Strategy](02-affected-keys-strategy.md)
+- [Multi-Table Joins & Denormalization](02-multi-table-joins.md) - Primary use case
 - [Snapshot Isolation](03-snapshot-isolation.md)
 - [Multi-Worker Architecture](04-multi-worker-architecture.md)
 - [Testing Strategy](05-testing-strategy.md)
 - [SQL Interface](06-sql-interface.md)
 - [Metadata Schema](07-metadata-schema.md)
 - [Implementation Phases](08-implementation-phases.md)
-- [Multi-Table Joins](09-multi-table-joins.md)
+- [Aggregation Strategy](09-aggregation-strategy.md) - Special case of affected keys

@@ -52,13 +52,13 @@ Snowflake-style dynamic tables on DuckLake with automatic incremental refresh an
 **Core System Design (Phases 1-3 - Single Worker):**
 
 1. [Overview](docs/01-overview.md) - Architecture and components
-2. [Affected Keys Strategy](docs/02-affected-keys-strategy.md) - Incremental refresh algorithm
+2. [Multi-Table Joins & Denormalization](docs/02-multi-table-joins.md) - Primary use case: incremental refresh for joins
 3. [Snapshot Isolation](docs/03-snapshot-isolation.md) - Consistency guarantees and query rewriting
 5. [Testing Strategy](docs/05-testing-strategy.md) - TDD approach and comprehensive test cases
 6. [SQL Interface](docs/06-sql-interface.md) - DDL syntax, validation, and submission methods
 7. [Metadata Schema](docs/07-metadata-schema.md) - PostgreSQL tables (4 core tables for single worker)
 8. [Implementation Phases](docs/08-implementation-phases.md) - Development roadmap and detailed requirements
-9. [Multi-Table Joins](docs/09-multi-table-joins.md) - Handling N-way joins and runtime cardinality
+9. [Aggregation Strategy](docs/09-aggregation-strategy.md) - Special case: single-table GROUP BY aggregations
 10. [Transactions & Consistency](docs/10-transactions-consistency.md) - Transactional refresh guarantees
 11. [Performance Considerations](docs/11-performance-considerations.md) - Why SQL-first approach is fast
 12. [Deduplication Strategy](docs/12-deduplication-strategy.md) - Avoid unnecessary writes with cost analysis
@@ -86,18 +86,23 @@ docker run -d dynamic-tables-worker \
   --duckdb-path /data/lake.db
 ```
 
-See [examples/](examples/) directory for complete SQL examples.
-
-
-
 ## SQL Example
 
+**Primary use case: Denormalization (flattening normalized tables)**
+
 ```sql
-CREATE DYNAMIC TABLE lake.dynamic.customer_metrics
+CREATE DYNAMIC TABLE lake.dynamic.order_details
 TARGET_LAG = '5 minutes'
 AS
-SELECT customer_id, COUNT(*), SUM(amount)
-FROM lake.orders
+SELECT 
+    o.order_id,
+    o.order_date,
+    o.amount,
+    c.customer_name,
+    c.customer_segment,
+    c.customer_region
+FROM lake.orders o
+JOIN lake.customers c ON o.customer_id = c.customer_id;
 GROUP BY customer_id;
 ```
 

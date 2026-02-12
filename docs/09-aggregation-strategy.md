@@ -30,10 +30,14 @@ def refresh_dynamic_table(table_name):
         for source_table in source_tables:
             snapshot_map[source_table] = get_current_snapshot(source_table)
         
+        # IMPORTANT: Rewrite query to use captured snapshots for consistency
+        # See 03-snapshot-isolation.md for rewrite_query_with_snapshots() implementation
+        rewritten_query = rewrite_query_with_snapshots(table.query_sql, snapshot_map)
+        
         # No CDC needed - just run the query from captured snapshot state
         execute(f"""
             INSERT INTO {table_name}
-            {table.query_sql}  -- Full query, no filtering
+            {rewritten_query}  -- Query with snapshot clauses injected
         """)
         
         # Record the snapshots we actually used
@@ -144,12 +148,11 @@ def extract_grouping_columns(sql: str) -> list[str]:
 def refresh_affected_keys(
     conn, 
     dynamic_table_name: str,
-    source_table: str,
+    query_sql: str,  # Full user query (will be rewritten with snapshots)
+    source_tables: dict[str, int],  # {table_name: snapshot_id}
     group_by_cols: list[str],
-    select_clause: str,
-    from_clause: str,
-    last_snapshot: int,
-    current_snapshot: int
+    last_snapshot: int,  # For CDC detection
+    current_snapshot: int  # For CDC detection
 ):
     """
     Refresh dynamic table using affected keys strategy.
@@ -159,10 +162,13 @@ def refresh_affected_keys(
     
     # Step 1: Extract affected keys (runs in DuckDB)
     # TEMP table goes to memory catalog, not DuckLake (no snapshot created)
+    # Note: We extract keys from the PRIMARY source table's CDC
+    # For multi-table queries, see 02-multi-table-joins.md for handling multiple sources
+    primary_source = list(source_tables.keys())[0]  # Simplified - may have multiple sources
     conn.execute(f"""
         CREATE TEMP TABLE affected_keys AS
         SELECT DISTINCT {key_list}
-        FROM table_changes('{source_table}', {last_snapshot}, {current_snapshot})
+        FROM table_changes('{primary_source}', {last_snapshot}, {current_snapshot})
     """)
     
     # Step 2: Build WHERE clause for key filtering
@@ -173,7 +179,12 @@ def refresh_affected_keys(
         key_tuple = f"({key_list})"
         where_clause = f"WHERE {key_tuple} IN (SELECT {key_list} FROM affected_keys)"
     
-    # Step 3: Transactional refresh (all in DuckDB)
+    # Step 3: Rewrite query to use snapshots for consistency
+    # This ensures we read all sources at the snapshot they were last refreshed from
+    # See 03-snapshot-isolation.md for implementation details
+    rewritten_query = rewrite_query_with_snapshots(query_sql, source_tables)
+    
+    # Step 4: Transactional refresh (all in DuckDB)
     conn.execute("BEGIN TRANSACTION")
     
     try:
@@ -183,13 +194,11 @@ def refresh_affected_keys(
             {where_clause}
         """)
         
-        # Recompute affected keys from source
+        # Recompute affected keys from source using rewritten query
+        # Note: where_clause filters to affected keys only
         conn.execute(f"""
             INSERT INTO {dynamic_table_name}
-            SELECT {select_clause}
-            FROM {from_clause}
-            {where_clause}
-            GROUP BY {key_list}
+            {add_where_clause_to_query(rewritten_query, where_clause)}
         """)
         
         conn.execute("COMMIT")
@@ -206,13 +215,18 @@ def refresh_affected_keys(
 refresh_affected_keys(
     conn=duckdb_conn,
     dynamic_table_name='customer_metrics',
-    source_table='orders',
+    query_sql='SELECT customer_id, COUNT(*) as order_count, SUM(amount) FROM orders GROUP BY customer_id',
+    source_tables={'orders': 100},  # Read orders at snapshot 100
     group_by_cols=['customer_id'],
-    select_clause='customer_id, COUNT(*) as order_count, SUM(amount) as total_amount',
-    from_clause='orders',
-    last_snapshot=42,
-    current_snapshot=43
+    last_snapshot=100,  # Last refresh used snapshot 100
+    current_snapshot=105  # Detect changes from 100 to 105
 )
+
+# Helper functions (see 03-snapshot-isolation.md for detailed implementation):
+# - rewrite_query_with_snapshots(query_sql, snapshot_map): 
+#     Injects FOR SYSTEM_TIME AS OF SNAPSHOT clauses into SQL AST
+# - add_where_clause_to_query(query_sql, where_clause):
+#     Adds/combines WHERE clause for affected keys filtering
 ```
 
 **Performance:**
