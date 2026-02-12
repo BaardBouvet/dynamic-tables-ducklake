@@ -171,11 +171,13 @@ class DynamicTableRefresher:
             # If parsing fails, raise error - we cannot proceed without snapshot isolation
             raise RuntimeError(f"Failed to rewrite query with snapshot isolation: {e}") from e
 
-    def refresh_table(self, table_name: str) -> Dict[str, Any]:
+    def refresh_table(self, table_name: str, auto_commit: bool = True, batch_snapshot: int | None = None) -> Dict[str, Any]:
         """Perform full refresh of a dynamic table.
 
         Args:
             table_name: Name of table to refresh
+            auto_commit: If True, manage own transaction. If False, caller manages transaction.
+            batch_snapshot: If provided, use this snapshot for all base tables (batch mode)
 
         Returns:
             Refresh metrics (rows_affected, duration_ms, etc.)
@@ -221,6 +223,9 @@ class DynamicTableRefresher:
         snapshots_to_use = {}
         
         # First pass: inherit snapshots from dynamic table dependencies
+        # Also detect conflicts where multiple dependencies used different snapshots
+        snapshot_sources: dict[str, dict[str, int]] = {}  # source_table -> {dep_table -> snapshot_id}
+        
         for dep in direct_dependencies:
             # Check if this dependency is a dynamic table
             cursor.execute(
@@ -240,20 +245,99 @@ class DynamicTableRefresher:
                     (dep,)
                 )
                 dep_snapshots = {row[0]: row[1] for row in cursor.fetchall()}
-                # Merge these snapshots - dynamic table snapshots take priority
+                
+                # Track which dependency used which snapshot for each source table
+                for source_table, snapshot_id in dep_snapshots.items():
+                    if source_table not in snapshot_sources:
+                        snapshot_sources[source_table] = {}
+                    snapshot_sources[source_table][dep] = snapshot_id
+                
+                # Merge these snapshots
                 snapshots_to_use.update(dep_snapshots)
+        
+        # Detect conflicts: source tables used by multiple dependencies with different snapshots
+        conflicting_deps: set[str] = set()
+        for source_table, dep_snapshots in snapshot_sources.items():
+            if len(dep_snapshots) > 1:
+                # Multiple dependencies use this source table
+                snapshot_values = list(dep_snapshots.values())
+                if len(set(snapshot_values)) > 1:
+                    # They used different snapshots - conflict!
+                    conflicting_deps.update(dep_snapshots.keys())
+        
+        # If we have conflicting dependencies, refresh them together first
+        if conflicting_deps and auto_commit:
+            # Refresh conflicting dependencies in a single transaction
+            # Capture snapshot ONCE for consistency
+            result = self.duckdb.execute("""
+                SELECT snapshot_id 
+                FROM ducklake.snapshots() 
+                ORDER BY snapshot_id DESC 
+                LIMIT 1
+            """).fetchone()
+            
+            conflict_batch_snapshot: int | None = int(result[0]) if result else None
+            
+            # Start a single transaction for all conflicting dependencies
+            self.duckdb.execute("BEGIN TRANSACTION")
+            
+            try:
+                for dep in sorted(conflicting_deps):  # Sort for determinism
+                    self.refresh_table(dep, auto_commit=False, batch_snapshot=conflict_batch_snapshot)
+                
+                # Commit all refreshes together
+                self.duckdb.execute("COMMIT")
+                self.metadata.conn.commit()
+                
+            except Exception:
+                # Rollback on failure, but don't hide the original exception
+                # if the rollback itself fails (e.g., transaction already rolled back)
+                try:
+                    self.duckdb.execute("ROLLBACK")
+                except Exception:
+                    # Ignore rollback errors - we want to raise the original exception
+                    pass
+                raise
+            
+            # Now re-collect snapshots from the freshly-refreshed dependencies
+            snapshots_to_use = {}
+            for dep in direct_dependencies:
+                cursor.execute(
+                    "SELECT name FROM dynamic_tables WHERE name = %s",
+                    (dep,)
+                )
+                is_dynamic_table = cursor.fetchone() is not None
+                
+                if is_dynamic_table:
+                    cursor.execute(
+                        """
+                        SELECT source_table, last_snapshot
+                        FROM source_snapshots
+                        WHERE dynamic_table = %s
+                    """,
+                        (dep,)
+                    )
+                    dep_snapshots = {row[0]: row[1] for row in cursor.fetchall()}
+                    snapshots_to_use.update(dep_snapshots)
+        
         
         # Second pass: capture current snapshot for any missing dependencies
         # (including the direct dependencies themselves)
-        result = self.duckdb.execute("""
-            SELECT snapshot_id 
-            FROM ducklake.snapshots() 
-            ORDER BY snapshot_id DESC 
-            LIMIT 1
-        """).fetchone()
-        
-        if result:
-            current_snapshot = result[0]
+        # If batch_snapshot is provided (refresh_all mode), use it for consistency
+        current_snapshot: int | None
+        if batch_snapshot is not None:
+            current_snapshot = batch_snapshot
+        else:
+            result = self.duckdb.execute("""
+                SELECT snapshot_id 
+                FROM ducklake.snapshots() 
+                ORDER BY snapshot_id DESC 
+                LIMIT 1
+            """).fetchone()
+            
+            current_snapshot = int(result[0]) if result else None
+
+        if current_snapshot is not None:
             for dep in direct_dependencies:
                 if dep not in snapshots_to_use:
                     snapshots_to_use[dep] = current_snapshot
@@ -298,10 +382,12 @@ class DynamicTableRefresher:
             )
 
             if table_exists:
-                # Delete existing data (with transaction)
-                self.duckdb.execute("BEGIN TRANSACTION")
+                # Delete existing data (with transaction if auto_commit)
+                if auto_commit:
+                    self.duckdb.execute("BEGIN TRANSACTION")
                 self.duckdb.execute(f"DELETE FROM {full_table_name}")
-                self.duckdb.execute("COMMIT")
+                if auto_commit:
+                    self.duckdb.execute("COMMIT")
             else:
                 # Create table from query (DDL - outside transaction)
                 # Use original query for schema inference, not snapshot query
@@ -312,14 +398,16 @@ class DynamicTableRefresher:
                     ) LIMIT 0
                 """)
 
-            # Insert data (DML - in transaction)
+            # Insert data (DML - in transaction if auto_commit)
             # Use snapshot-isolated query for actual data
-            self.duckdb.execute("BEGIN TRANSACTION")
+            if auto_commit:
+                self.duckdb.execute("BEGIN TRANSACTION")
             self.duckdb.execute(f"""
                 INSERT INTO {full_table_name}
                 {query_with_snapshots}
             """)
-            self.duckdb.execute("COMMIT")
+            if auto_commit:
+                self.duckdb.execute("COMMIT")
 
             # Get row count
             rows_affected = self.duckdb.execute(
@@ -356,16 +444,19 @@ class DynamicTableRefresher:
                     (table_name, source_table, snapshot_id, datetime.now(UTC)),
                 )
 
-            self.metadata.conn.commit()
+            if auto_commit:
+                self.metadata.conn.commit()
 
             return {"status": "SUCCESS", "rows_affected": rows_affected, "duration_ms": duration_ms}
 
         except Exception as e:
-            # Rollback transaction if it was started
-            try:
-                self.duckdb.execute("ROLLBACK")
-            except Exception:
-                pass
+            # Rollback transaction if it was started (only in auto_commit mode)
+            if auto_commit:
+                try:
+                    self.duckdb.execute("ROLLBACK")
+                except Exception:
+                    # Ignore rollback errors - we want to raise the original exception
+                    pass
 
             # Update history with error
             cursor.execute(
@@ -379,11 +470,16 @@ class DynamicTableRefresher:
                 (datetime.now(UTC), str(e), history_id),
             )
 
-            self.metadata.conn.commit()
+            if auto_commit:
+                self.metadata.conn.commit()
             raise
 
     def refresh_all(self) -> List[Dict[str, Any]]:
         """Refresh all dynamic tables in dependency order.
+        
+        All tables are refreshed within a single DuckDB transaction to ensure
+        they all see the same snapshot of base tables. This prevents inconsistencies
+        when multiple dynamic tables depend on the same base table.
 
         Returns:
             List of refresh results for each table
@@ -391,11 +487,42 @@ class DynamicTableRefresher:
         graph = self._load_dependency_graph()
         sorted_tables = graph.topological_sort()
 
+        # Capture snapshot ONCE at the start of the batch
+        # All tables will use this snapshot for base tables
+        result = self.duckdb.execute("""
+            SELECT snapshot_id 
+            FROM ducklake.snapshots() 
+            ORDER BY snapshot_id DESC 
+            LIMIT 1
+        """).fetchone()
+        
+        batch_snapshot: int | None = int(result[0]) if result else None
+
         results = []
-        for table_name in sorted_tables:
-            result = self.refresh_table(table_name)
-            result["table"] = table_name
-            results.append(result)
+        
+        # Start a single DuckDB transaction for all refreshes
+        self.duckdb.execute("BEGIN TRANSACTION")
+        
+        try:
+            for table_name in sorted_tables:
+                result = self.refresh_table(table_name, auto_commit=False, batch_snapshot=batch_snapshot)
+                result["table"] = table_name
+                results.append(result)
+            
+            # Commit the entire batch
+            self.duckdb.execute("COMMIT")
+            
+            # Commit all metadata changes
+            self.metadata.conn.commit()
+            
+        except Exception:
+            # Rollback everything on failure
+            try:
+                self.duckdb.execute("ROLLBACK")
+            except Exception:
+                # Ignore rollback errors - we want to raise the original exception
+                pass
+            raise
 
         return results
 

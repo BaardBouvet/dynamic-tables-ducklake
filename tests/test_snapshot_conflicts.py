@@ -16,10 +16,11 @@ class TestSnapshotConflicts:
     def test_conflicting_snapshots_from_multiple_dependencies(
         self, refresher: Any, duckdb_conn: Any
     ) -> None:
-        """Test that refresh_all() avoids conflicts by using a single transaction.
+        """Test that refreshing D auto-refreshes B and C together when they have conflicting snapshots.
         
-        When B and C are refreshed in a single transaction (via refresh_all()), they
-        see the same snapshot of A, ensuring consistency for D which depends on both.
+        When D depends on B and C, and B and C used different snapshots of A, the system
+        should detect this and automatically refresh B and C together in a transaction
+        before refreshing D, ensuring consistency.
         """
         # Create base table A
         duckdb_conn.execute("""
@@ -48,6 +49,13 @@ class TestSnapshotConflicts:
         GROUP BY product_id
         """
         refresher.create_dynamic_table(DDLParser.parse(ddl_b))
+        refresher.refresh_table("order_summary_b")
+        
+        # Add more data to A (creates new snapshot)
+        duckdb_conn.execute("""
+            INSERT INTO orders VALUES
+            (3, 103, 300.00, '2024-01-03')
+        """)
         
         # Create dynamic table C that also depends on A
         ddl_c = """
@@ -59,6 +67,28 @@ class TestSnapshotConflicts:
         GROUP BY product_id
         """
         refresher.create_dynamic_table(DDLParser.parse(ddl_c))
+        refresher.refresh_table("order_summary_c")
+        
+        # Verify B and C used different snapshots of orders
+        cursor = refresher.metadata.conn.cursor()
+        cursor.execute("""
+            SELECT last_snapshot
+            FROM source_snapshots
+            WHERE dynamic_table = 'order_summary_b'
+            AND source_table = 'orders'
+        """)
+        b_snapshot_before = cursor.fetchone()[0]
+        
+        cursor.execute("""
+            SELECT last_snapshot
+            FROM source_snapshots
+            WHERE dynamic_table = 'order_summary_c'
+            AND source_table = 'orders'
+        """)
+        c_snapshot_before = cursor.fetchone()[0]
+        
+        assert b_snapshot_before != c_snapshot_before, \
+            "B and C should have different snapshots initially"
         
         # Create D that depends on both B and C
         ddl_d = """
@@ -74,19 +104,18 @@ class TestSnapshotConflicts:
         """
         refresher.create_dynamic_table(DDLParser.parse(ddl_d))
         
-        # Use refresh_all() to refresh all tables in a single transaction
-        # This ensures B and C see the same snapshot of orders
-        refresher.refresh_all()
+        # When we refresh D, it should detect the conflict and automatically
+        # refresh B and C together first
+        refresher.refresh_table("order_validation")
         
-        # Verify that B and C used the same snapshot of orders
-        cursor = refresher.metadata.conn.cursor()
+        # Verify that B and C now use the same snapshot of orders
         cursor.execute("""
             SELECT last_snapshot
             FROM source_snapshots
             WHERE dynamic_table = 'order_summary_b'
             AND source_table = 'orders'
         """)
-        b_snapshot = cursor.fetchone()[0]
+        b_snapshot_after = cursor.fetchone()[0]
         
         cursor.execute("""
             SELECT last_snapshot
@@ -94,11 +123,15 @@ class TestSnapshotConflicts:
             WHERE dynamic_table = 'order_summary_c'
             AND source_table = 'orders'
         """)
-        c_snapshot = cursor.fetchone()[0]
+        c_snapshot_after = cursor.fetchone()[0]
         
-        # They should use the same snapshot because they were refreshed in one transaction
-        assert b_snapshot == c_snapshot, \
-            f"B and C should use the same snapshot when refreshed together, but got {b_snapshot} and {c_snapshot}"
+        # They should now use the same snapshot (both were auto-refreshed)
+        assert b_snapshot_after == c_snapshot_after, \
+            f"After refreshing D, B and C should use the same snapshot, but got {b_snapshot_after} and {c_snapshot_after}"
+        
+        # B and C should have been refreshed (different from before)
+        assert b_snapshot_after != b_snapshot_before, "B should have been refreshed"
+        assert c_snapshot_after != c_snapshot_before, "C should have been refreshed"
         
         # Verify D was refreshed successfully
         cursor.execute("""
@@ -111,20 +144,6 @@ class TestSnapshotConflicts:
         result = cursor.fetchone()
         assert result is not None
         assert result[0] == "SUCCESS", "order_validation should refresh successfully"
-
-    @pytest.mark.skip(reason="Independent refreshes can lead to inconsistency - use refresh_all() instead")
-    def test_independent_refreshes_show_inconsistency(
-        self, refresher: Any, duckdb_conn: Any
-    ) -> None:
-        """Document that independent refreshes can lead to inconsistency.
-        
-        When B and C are refreshed independently at different times, they will
-        use different snapshots. This test documents the problem case. 
-        SOLUTION: Always use refresh_all() to refresh interdependent tables together.
-        """
-        # Test body omitted - this documents undesirable behavior
-        # Use test_conflicting_snapshots_from_multiple_dependencies to see the solution
-        pass
 
 
 
