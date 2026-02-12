@@ -67,7 +67,7 @@ class MetadataStore:
 
     def __init__(self, connection_string: str):
         """Initialize metadata store.
-        
+
         Args:
             connection_string: PostgreSQL connection string
         """
@@ -83,7 +83,7 @@ class MetadataStore:
         """Initialize metadata schema."""
         if not self._conn:
             raise RuntimeError("Not connected to database")
-        
+
         with self._conn.cursor() as cur:
             cur.execute(METADATA_SCHEMA)
         self._conn.commit()

@@ -33,10 +33,6 @@ dtable = "dynamic_tables.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/dynamic_tables"]
 
-[tool.black]
-line-length = 100
-target-version = ["py311"]
-
 [tool.ruff]
 line-length = 100
 target-version = "py311"
