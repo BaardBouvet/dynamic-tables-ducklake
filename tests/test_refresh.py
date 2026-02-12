@@ -331,3 +331,177 @@ class TestDynamicTableRefresh:
         assert row[1] == "SUCCESS"
         assert row[2] == "FULL"
         assert row[3] == 2
+
+    def test_snapshots_captured_during_refresh(
+        self, refresher: Any, duckdb_conn: Any, sample_source_data: Any
+    ) -> None:
+        """Test that source snapshots are captured before query execution."""
+        # Get current snapshot of sales table before creating dynamic table
+        initial_snapshot = duckdb_conn.execute("""
+            SELECT snapshot_id 
+            FROM ducklake.snapshots() 
+            ORDER BY snapshot_id DESC 
+            LIMIT 1
+        """).fetchone()[0]
+
+        ddl = """
+        CREATE DYNAMIC TABLE sales_summary
+        TARGET_LAG = '5 minutes'
+        AS
+        SELECT product_id, SUM(amount) as total
+        FROM sales
+        GROUP BY product_id
+        """
+
+        refresher.create_dynamic_table(DDLParser.parse(ddl))
+        refresher.refresh_table("sales_summary")
+
+        # Verify snapshots were captured in source_snapshots table
+        cursor = refresher.metadata.conn.cursor()
+        cursor.execute("""
+            SELECT source_table, last_snapshot
+            FROM source_snapshots
+            WHERE dynamic_table = 'sales_summary'
+        """)
+
+        snapshots = cursor.fetchall()
+        assert len(snapshots) == 1
+        assert snapshots[0][0] == "sales"  # source_table
+        assert snapshots[0][1] >= initial_snapshot  # last_snapshot should be >= initial
+
+        # Verify snapshots were recorded in refresh_history
+        cursor.execute("""
+            SELECT source_snapshots
+            FROM refresh_history
+            WHERE dynamic_table = 'sales_summary'
+            ORDER BY started_at DESC
+            LIMIT 1
+        """)
+
+        history_row = cursor.fetchone()
+        assert history_row is not None
+        source_snapshots_json = history_row[0]
+        assert source_snapshots_json is not None
+        assert "sales" in source_snapshots_json
+        assert source_snapshots_json["sales"] >= initial_snapshot
+
+    def test_snapshots_tracked_for_dependent_tables(
+        self, refresher: Any, duckdb_conn: Any, sample_source_data: Any
+    ) -> None:
+        """Test that snapshots are tracked for dynamic tables that depend on other dynamic tables."""
+        # Create first-level dynamic table
+        ddl1 = """
+        CREATE DYNAMIC TABLE sales_summary
+        TARGET_LAG = '5 minutes'
+        AS
+        SELECT product_id, SUM(amount) as total
+        FROM sales
+        GROUP BY product_id
+        """
+
+        refresher.create_dynamic_table(DDLParser.parse(ddl1))
+        refresher.refresh_table("sales_summary")
+
+        # Create second-level dynamic table that depends on sales_summary
+        ddl2 = """
+        CREATE DYNAMIC TABLE high_value_products
+        TARGET_LAG = '5 minutes'
+        AS
+        SELECT product_id
+        FROM sales_summary
+        WHERE total > 200
+        """
+
+        refresher.create_dynamic_table(DDLParser.parse(ddl2))
+        refresher.refresh_table("high_value_products")
+
+        # Verify that high_value_products has snapshots for both sales_summary and sales
+        cursor = refresher.metadata.conn.cursor()
+        cursor.execute("""
+            SELECT source_table, last_snapshot
+            FROM source_snapshots
+            WHERE dynamic_table = 'high_value_products'
+            ORDER BY source_table
+        """)
+
+        snapshots = cursor.fetchall()
+        # Should have snapshots for both sales (transitive) and sales_summary (direct)
+        assert len(snapshots) == 2
+        assert snapshots[0][0] == "sales"
+        assert snapshots[1][0] == "sales_summary"
+
+    def test_snapshot_isolation_in_dependency_chain(
+        self, refresher: Any, duckdb_conn: Any
+    ) -> None:
+        """Test that snapshot isolation ensures consistency in dependency chains.
+        
+        Scenario: C depends on both A and B, where B also depends on A.
+        When C refreshes, it must read A at the same snapshot that B used,
+        otherwise the data from A and B could be inconsistent.
+        """
+        # Create base table A
+        duckdb_conn.execute("""
+            CREATE TABLE orders (
+                order_id INTEGER,
+                amount DECIMAL(10,2)
+            )
+        """)
+        duckdb_conn.execute("INSERT INTO orders VALUES (1, 100), (2, 200)")
+
+        # Create dynamic table B that depends on A
+        ddl_b = """
+        CREATE DYNAMIC TABLE order_summary
+        TARGET_LAG = '5 minutes'
+        AS
+        SELECT COUNT(*) as order_count, SUM(amount) as total_amount
+        FROM orders
+        """
+        refresher.create_dynamic_table(DDLParser.parse(ddl_b))
+        refresher.refresh_table("order_summary")
+
+        # Verify B's results
+        result_b = duckdb_conn.execute("SELECT order_count, total_amount FROM order_summary").fetchone()
+        assert result_b[0] == 2  # 2 orders
+        assert result_b[1] == 300  # 100 + 200
+
+        # Now create dynamic table C that depends on both A and B
+        ddl_c = """
+        CREATE DYNAMIC TABLE order_validation
+        TARGET_LAG = '5 minutes'
+        AS
+        SELECT 
+            os.order_count,
+            os.total_amount,
+            COUNT(*) as actual_count,
+            SUM(o.amount) as actual_amount
+        FROM order_summary os
+        CROSS JOIN orders o
+        GROUP BY os.order_count, os.total_amount
+        """
+        refresher.create_dynamic_table(DDLParser.parse(ddl_c))
+        
+        # Insert more data into A BEFORE refreshing C
+        # This creates the scenario where A has progressed but B hasn't been refreshed yet
+        duckdb_conn.execute("INSERT INTO orders VALUES (3, 300)")
+        
+        # Refresh C - it should use the SAME snapshot of A that B used,
+        # not the current state of A
+        refresher.refresh_table("order_validation")
+
+        # Verify C read A at the snapshot that B used (2 orders, 300 total)
+        # NOT the current state (3 orders, 600 total)
+        result_c = duckdb_conn.execute("""
+            SELECT order_count, total_amount, actual_count, actual_amount 
+            FROM order_validation
+        """).fetchone()
+        
+        # If snapshot isolation works correctly:
+        # - order_count and total_amount come from B (2, 300)
+        # - actual_count and actual_amount come from A at the SAME snapshot B used (2, 300)
+        # So they should match
+        assert result_c[0] == result_c[2], "order_count should match actual_count (snapshot isolation)"
+        assert result_c[1] == result_c[3], "total_amount should match actual_amount (snapshot isolation)"
+        
+        # Cleanup
+        duckdb_conn.execute("DROP TABLE IF EXISTS orders")
+

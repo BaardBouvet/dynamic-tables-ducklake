@@ -3,6 +3,9 @@
 from typing import List, Dict, Any
 from datetime import datetime, UTC
 import time
+import json
+import sqlglot
+from sqlglot import exp
 
 from dynamic_tables.metadata import MetadataStore
 from dynamic_tables.parser import DynamicTableDefinition, DependencyGraph
@@ -110,6 +113,64 @@ class DynamicTableRefresher:
 
         self.metadata.conn.commit()
 
+    def _rewrite_query_with_snapshots(self, query_sql: str, snapshot_map: Dict[str, int]) -> str:
+        """Rewrite query to use FOR SYSTEM_TIME AS OF SNAPSHOT clauses.
+        
+        Args:
+            query_sql: Original SQL query
+            snapshot_map: Dict mapping table names to snapshot IDs
+            
+        Returns:
+            Rewritten SQL query with snapshot clauses
+            
+        Raises:
+            RuntimeError: If query rewriting fails
+        """
+        if not snapshot_map:
+            return query_sql
+            
+        try:
+            import re
+            
+            # Parse the SQL query
+            parsed = sqlglot.parse_one(query_sql, dialect='duckdb')
+            
+            # Find all table references and inject snapshot clauses
+            for table_node in parsed.find_all(exp.Table):
+                table_name = table_node.name
+                
+                if table_name in snapshot_map:
+                    snapshot_id = snapshot_map[table_name]
+                    
+                    # Create HistoricalData node for AT (VERSION => snapshot_id)
+                    # sqlglot natively supports this via HistoricalData expression
+                    historical = exp.HistoricalData(
+                        this='AT',
+                        kind='VERSION',
+                        expression=exp.Literal.number(snapshot_id)
+                    )
+                    
+                    # Attach the AT clause to the table node
+                    table_node.set('when', historical)
+            
+            # Convert back to SQL
+            result_sql = parsed.sql(dialect='duckdb')
+            
+            # Post-process: DuckDB requires alias BEFORE AT clause, but sqlglot generates AT before alias
+            # Reorder: "table AT (VERSION => N) AS alias" -> "table AS alias AT (VERSION => N)"
+            # Note: sqlglot always generates explicit AS, even for implicit aliases in input
+            result_sql = re.sub(
+                r'(\w+)\s+AT\s+\((VERSION\s+=>\s+\d+)\)\s+AS\s+(\w+)',
+                r'\1 AS \3 AT (\2)',
+                result_sql
+            )
+            
+            return result_sql
+            
+        except Exception as e:
+            # If parsing fails, raise error - we cannot proceed without snapshot isolation
+            raise RuntimeError(f"Failed to rewrite query with snapshot isolation: {e}") from e
+
     def refresh_table(self, table_name: str) -> Dict[str, Any]:
         """Perform full refresh of a dynamic table.
 
@@ -140,19 +201,79 @@ class DynamicTableRefresher:
 
         query_sql, schema_name = row
 
+        # For snapshot isolation, we need to determine which snapshots to use for each source table
+        # Strategy:
+        # 1. For each direct dependency that's a dynamic table, inherit the snapshots it used
+        # 2. For remaining dependencies (base tables or dynamic tables themselves), use current snapshot
+        # 3. This ensures consistency: if C depends on B and A, and B depends on A,
+        #    then C reads A at the same snapshot that B used
+        
+        cursor.execute(
+            """
+            SELECT DISTINCT upstream
+            FROM dependencies
+            WHERE downstream = %s
+        """,
+            (table_name,),
+        )
+        
+        direct_dependencies = [row[0] for row in cursor.fetchall()]
+        snapshots_to_use = {}
+        
+        # First pass: inherit snapshots from dynamic table dependencies
+        for dep in direct_dependencies:
+            # Check if this dependency is a dynamic table
+            cursor.execute(
+                "SELECT name FROM dynamic_tables WHERE name = %s",
+                (dep,)
+            )
+            is_dynamic_table = cursor.fetchone() is not None
+            
+            if is_dynamic_table:
+                # Use the snapshots that this dynamic table used
+                cursor.execute(
+                    """
+                    SELECT source_table, last_snapshot
+                    FROM source_snapshots
+                    WHERE dynamic_table = %s
+                """,
+                    (dep,)
+                )
+                dep_snapshots = {row[0]: row[1] for row in cursor.fetchall()}
+                # Merge these snapshots - dynamic table snapshots take priority
+                snapshots_to_use.update(dep_snapshots)
+        
+        # Second pass: capture current snapshot for any missing dependencies
+        # (including the direct dependencies themselves)
+        result = self.duckdb.execute("""
+            SELECT snapshot_id 
+            FROM ducklake.snapshots() 
+            ORDER BY snapshot_id DESC 
+            LIMIT 1
+        """).fetchone()
+        
+        if result:
+            current_snapshot = result[0]
+            for dep in direct_dependencies:
+                if dep not in snapshots_to_use:
+                    snapshots_to_use[dep] = current_snapshot
+        
+        # Rewrite query with snapshot isolation
+        query_with_snapshots = self._rewrite_query_with_snapshots(query_sql, snapshots_to_use)
+
         # Record start time
         started_at = datetime.now(UTC)
         start_time = time.time()
 
-        # Record refresh in history
+        # Record refresh in history with the snapshots we actually used
         cursor.execute(
             """
             INSERT INTO refresh_history (
-                dynamic_table, started_at, status, strategy_used
-            ) VALUES (%s, %s, 'RUNNING', 'FULL')
+                dynamic_table, started_at, status, strategy_used, source_snapshots
+            ) VALUES (%s, %s, 'RUNNING', 'FULL', %s)
             RETURNING id
         """,
-            (table_name, started_at),
+            (table_name, started_at, json.dumps(snapshots_to_use)),
         )
 
         result = cursor.fetchone()
@@ -183,6 +304,7 @@ class DynamicTableRefresher:
                 self.duckdb.execute("COMMIT")
             else:
                 # Create table from query (DDL - outside transaction)
+                # Use original query for schema inference, not snapshot query
                 self.duckdb.execute(f"""
                     CREATE TABLE {full_table_name} AS 
                     SELECT * FROM (
@@ -191,10 +313,11 @@ class DynamicTableRefresher:
                 """)
 
             # Insert data (DML - in transaction)
+            # Use snapshot-isolated query for actual data
             self.duckdb.execute("BEGIN TRANSACTION")
             self.duckdb.execute(f"""
                 INSERT INTO {full_table_name}
-                {query_sql}
+                {query_with_snapshots}
             """)
             self.duckdb.execute("COMMIT")
 
@@ -218,6 +341,20 @@ class DynamicTableRefresher:
             """,
                 (datetime.now(UTC), rows_affected, duration_ms, history_id),
             )
+
+            # Update source_snapshots table with the NEW snapshots we just captured
+            for source_table, snapshot_id in snapshots_to_use.items():
+                cursor.execute(
+                    """
+                    INSERT INTO source_snapshots (dynamic_table, source_table, last_snapshot, last_processed_at)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (dynamic_table, source_table)
+                    DO UPDATE SET 
+                        last_snapshot = EXCLUDED.last_snapshot,
+                        last_processed_at = EXCLUDED.last_processed_at
+                """,
+                    (table_name, source_table, snapshot_id, datetime.now(UTC)),
+                )
 
             self.metadata.conn.commit()
 
