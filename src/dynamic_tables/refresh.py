@@ -1,7 +1,7 @@
 """Dynamic table refresh logic."""
 
 from typing import List, Dict, Any
-from datetime import datetime
+from datetime import datetime, UTC
 import time
 
 from dynamic_tables.metadata import MetadataStore
@@ -141,7 +141,7 @@ class DynamicTableRefresher:
         query_sql, schema_name = row
 
         # Record start time
-        started_at = datetime.utcnow()
+        started_at = datetime.now(UTC)
         start_time = time.time()
 
         # Record refresh in history
@@ -216,7 +216,7 @@ class DynamicTableRefresher:
                     duration_ms = %s
                 WHERE id = %s
             """,
-                (datetime.utcnow(), rows_affected, duration_ms, history_id),
+                (datetime.now(UTC), rows_affected, duration_ms, history_id),
             )
 
             self.metadata.conn.commit()
@@ -239,7 +239,7 @@ class DynamicTableRefresher:
                     error_message = %s
                 WHERE id = %s
             """,
-                (datetime.utcnow(), str(e), history_id),
+                (datetime.now(UTC), str(e), history_id),
             )
 
             self.metadata.conn.commit()

@@ -1,7 +1,6 @@
 """Test metadata store initialization."""
 
 from typing import Any
-import pytest
 
 
 def test_metadata_store_init(metadata_store: Any) -> None:
@@ -80,9 +79,6 @@ def test_duckdb_s3_integration(duckdb_conn: Any, minio_client: Any) -> None:
     assert len(objects) > 0, "Expected DuckLake to write data files to S3"
 
 
-@pytest.mark.skip(
-    reason="DuckLake snapshot time-travel needs investigation - may require specific configuration"
-)
 def test_ducklake_snapshots(duckdb_conn: Any) -> None:
     """Test that DuckLake snapshot functionality works."""
     # Create a table
