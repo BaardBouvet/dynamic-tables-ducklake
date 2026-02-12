@@ -21,7 +21,7 @@ class TestDDLParser:
         definition = DDLParser.parse(ddl)
         
         assert definition.name == "sales_summary"
-        assert definition.schema_name == "dynamic"
+        assert definition.schema_name == "main"
         assert definition.target_lag == "5 minutes"
         assert "sales" in definition.source_tables
         assert "product_id" in definition.group_by_columns

@@ -33,6 +33,15 @@ def metadata_store(postgres_container):
     store = MetadataStore(connection_string)
     store.connect()
     yield store
+    
+    # Clean up tables between tests
+    cursor = store.conn.cursor()
+    cursor.execute("TRUNCATE TABLE refresh_history CASCADE")
+    cursor.execute("TRUNCATE TABLE dependencies CASCADE")
+    cursor.execute("TRUNCATE TABLE source_snapshots CASCADE")
+    cursor.execute("TRUNCATE TABLE dynamic_tables CASCADE")
+    store.conn.commit()
+    
     store.close()
 
 
@@ -59,6 +68,18 @@ def duckdb_conn(minio_container, postgres_container):
     """DuckDB connection with DuckLake extension and MinIO backend."""
     conn = duckdb.connect(":memory:")
     
+    # Ensure bucket exists
+    config = minio_container.get_config()
+    minio_cli = Minio(
+        config["endpoint"],
+        access_key=minio_container.access_key,
+        secret_key=minio_container.secret_key,
+        secure=False,
+    )
+    bucket = "test-bucket"
+    if not minio_cli.bucket_exists(bucket):
+        minio_cli.make_bucket(bucket)
+    
     # Install and load DuckLake extension (required)
     try:
         # Load httpfs for S3 support
@@ -69,7 +90,6 @@ def duckdb_conn(minio_container, postgres_container):
         conn.execute("LOAD ducklake;")
         
         # Configure S3 settings for MinIO
-        config = minio_container.get_config()
         conn.execute(f"""
             SET s3_endpoint='{config['endpoint']}';
             SET s3_access_key_id='{minio_container.access_key}';
@@ -79,7 +99,6 @@ def duckdb_conn(minio_container, postgres_container):
         """)
         
         # Attach DuckLake with PostgreSQL as catalog and S3 for data
-        bucket = "test-bucket"
         data_path = f"s3://{bucket}/ducklake-data/"
         
         # Parse PostgreSQL connection URL to libpq format
@@ -108,9 +127,15 @@ def duckdb_conn(minio_container, postgres_container):
     
     yield conn
     
-    # Cleanup
-    try:
-        conn.execute("DETACH ducklake;")
-    except:
-        pass
+    # Cleanup - drop all tables after each test
+    tables = conn.execute("""
+        SELECT table_name FROM information_schema.tables 
+        WHERE table_schema = 'main' 
+        AND table_type = 'BASE TABLE'
+    """).fetchall()
+    
+    # Drop each table
+    for (table_name,) in tables:
+        conn.execute(f"DROP TABLE IF EXISTS main.{table_name}")
+    
     conn.close()

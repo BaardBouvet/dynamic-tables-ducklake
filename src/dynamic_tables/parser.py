@@ -63,7 +63,8 @@ class DDLParser:
             schema_name = name_match.group(1)
             table_name = name_match.group(2)
         else:
-            schema_name = "dynamic"
+            # Default to 'main' schema - this is DuckDB's default schema
+            schema_name = "main"
             table_name = name_match.group(3)
         
         # Extract TARGET_LAG
@@ -212,8 +213,9 @@ class DependencyGraph:
         in_degree = {node: 0 for node in self.graph}
         
         # Count incoming edges (how many tables does this table depend on)
+        # Only count dependencies that are also dynamic tables (in the graph)
         for node in self.graph:
-            in_degree[node] = len(self.graph[node])
+            in_degree[node] = len([dep for dep in self.graph[node] if dep in self.graph])
         
         # Start with nodes that have no dependencies
         queue = [node for node in self.graph if in_degree[node] == 0]
