@@ -17,10 +17,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
     "testcontainers>=3.7.0",
     "minio>=7.2.0",
     "ruff>=0.1.0",
-    "mypy>=1.7.0",
+    "ty>=0.0.1",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -30,11 +31,8 @@ packages = ["src/dynamic_tables"]
 line-length = 100
 target-version = "py311"
 
-[tool.mypy]
-python_version = "3.11"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = true
+[tool.ty.environment]
+python-version = "3.11"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

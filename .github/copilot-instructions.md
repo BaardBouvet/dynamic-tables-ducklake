@@ -12,6 +12,6 @@
   - Formatting: `uv run ruff format .`
   - Auto-fix issues: `uv run ruff check --fix .`
 
-- **Type Checking**: Always use `mypy` for static type checking
-  - Type check: `uv run mypy .`
-  - Type check specific file: `uv run mypy <file_path>`
+- **Type Checking**: Always use `ty` for static type checking
+  - Type check: `uv run ty check`
+  - Type check specific file: `uv run ty check <file_path>`

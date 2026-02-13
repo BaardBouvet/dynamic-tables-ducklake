@@ -332,9 +332,7 @@ class DynamicTableRefresher:
                 snapshots_to_use[dep] = batch_snapshot
 
         # Decide on refresh strategy
-        use_incremental = self._should_use_incremental(
-            table_name, previous_snapshots, query_sql
-        )
+        use_incremental = self._should_use_incremental(table_name, previous_snapshots, query_sql)
         strategy = "INCREMENTAL" if use_incremental else "FULL"
 
         # Rewrite query with snapshot isolation
@@ -391,7 +389,7 @@ class DynamicTableRefresher:
 
                 # Create TEMP table to accumulate ALL affected keys across all source tables
                 key_columns = ", ".join(group_by_keys)
-                
+
                 # Create temp table by selecting GROUP BY columns from the actual query
                 # This ensures we get the right column types
                 self.duckdb.execute(f"""
@@ -684,7 +682,7 @@ class DynamicTableRefresher:
                         )
                         inherited_snapshots = {row[0]: row[1] for row in cursor.fetchall()}
                         all_source_snapshots.update(inherited_snapshots)
-                    
+
                     # Also track the dependency itself with final snapshot
                     all_source_snapshots[dep] = final_snapshot
 

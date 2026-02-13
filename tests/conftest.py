@@ -2,8 +2,8 @@
 
 from typing import Any, Iterator, Tuple
 import pytest
-from testcontainers.postgres import PostgresContainer  # type: ignore
-from testcontainers.minio import MinioContainer  # type: ignore
+from testcontainers.postgres import PostgresContainer
+from testcontainers.minio import MinioContainer
 import duckdb
 from minio import Minio
 
