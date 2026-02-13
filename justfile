@@ -19,7 +19,7 @@ coverage:
 # Run tests with coverage and open HTML report
 coverage-html: coverage
     @echo "Opening coverage report..."
-    @python -m webbrowser htmlcov/index.html || open htmlcov/index.html || xdg-open htmlcov/index.html
+    @uv run python -m webbrowser htmlcov/index.html || open htmlcov/index.html || xdg-open htmlcov/index.html
 
 # Lint code with ruff
 lint:
@@ -69,6 +69,12 @@ watch:
 # Show project information
 info:
     @echo "Python version:"
-    @python --version
+    @uv run python --version
     @echo "\nInstalled packages:"
     @uv pip list
+
+# === Benchmarking Commands ===
+
+# Run benchmarks (use: just benchmark [--quick|--full] [--save NAME] [--compare BASELINE] [--markdown])
+benchmark *ARGS:
+    uv run python tests/run_benchmarks.py {{ARGS}}

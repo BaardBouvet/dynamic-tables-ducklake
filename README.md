@@ -86,6 +86,46 @@ docker run -d dynamic-tables-worker \
   --duckdb-path /data/lake.db
 ```
 
+## Development
+
+### Setup
+
+```bash
+# Install dependencies
+just install
+
+# Run tests
+just test
+
+# Run tests with coverage
+just coverage
+```
+
+### Benchmarking
+
+Phase 2 focuses on performance optimizations. We have comprehensive benchmarks to validate improvements:
+
+```bash
+# Quick benchmarks (~2 min, for development iteration)
+just benchmark-quick
+
+# Full benchmark suite (~30 min, for pre-merge validation)
+just benchmark
+
+# Compare against baseline
+just benchmark-compare main
+
+# Run with memory profiling
+just benchmark-profile
+```
+
+**Performance Targets (Phase 2):**
+- 10-100x speedup for incremental refresh vs full refresh (at <30% affected cardinality)
+- Sub-second refresh for <100K affected keys
+- Linear scaling to 10M affected keys with out-of-core processing
+
+See [Benchmarking Guide](docs/BENCHMARKING.md) for detailed documentation.
+
 ## SQL Example
 
 **Primary use case: Denormalization (flattening normalized tables)**

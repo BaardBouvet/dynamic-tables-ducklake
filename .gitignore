@@ -50,3 +50,11 @@ dmypy.json
 
 # Minio test data
 .minio-data/
+
+# Benchmarking
+benchmark_report.md
+.benchmark_cache/
+profile_*.dat
+*.prof
+/tmp/duckdb_bench/
+# Note: .benchmarks/ is tracked for baseline storage

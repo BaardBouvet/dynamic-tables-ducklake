@@ -18,10 +18,13 @@ dependencies = [
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
+    "pytest-benchmark[histogram]>=4.0.0",
     "testcontainers>=3.7.0",
     "minio>=7.2.0",
     "ruff>=0.1.0",
     "ty>=0.0.1",
+    "memory-profiler>=0.61.0",
+    "matplotlib>=3.8.0",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -40,3 +43,10 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
+markers = [
+    "quick: Quick benchmarks with tiny/small datasets (~20s)",
+    "full: Full benchmarks with medium/large/xlarge datasets (~30min)",
+]
+
+# Note: pytest-benchmark configuration is passed via CLI in justfile commands
+# See: just benchmark-quick, just benchmark, etc.

@@ -9,6 +9,9 @@ from minio import Minio
 
 from dynamic_tables.metadata import MetadataStore
 
+# Load benchmark fixtures
+pytest_plugins = ["tests.conftest_benchmark"]
+
 
 @pytest.fixture(scope="session")
 def postgres_container() -> Iterator[Any]:
