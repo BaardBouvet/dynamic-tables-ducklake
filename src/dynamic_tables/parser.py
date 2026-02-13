@@ -1,164 +1,68 @@
-"""DDL parser for dynamic table definitions."""
+"""Dynamic table definitions and dependency management."""
 
 from dataclasses import dataclass
 from typing import List, Set, Dict
-import re
 import sqlglot
 from sqlglot import exp
 
 
+def extract_source_tables(query: str) -> List[str]:
+    """Extract source table names from query.
+
+    Args:
+        query: SQL query
+
+    Returns:
+        List of table names (schema.table format if schema is specified)
+
+    Raises:
+        ValueError: If query cannot be parsed
+    """
+    try:
+        parsed = sqlglot.parse_one(query, read="duckdb")
+        tables = set()
+
+        for table in parsed.find_all(exp.Table):
+            table_name = table.name
+            # Include schema if present (db property in sqlglot), otherwise just table name
+            if table.db:
+                tables.add(f"{table.db}.{table_name}")
+            else:
+                tables.add(table_name)
+
+        return sorted(tables)
+    except Exception as e:
+        raise ValueError(f"Failed to parse query: {e}")
+
+
 @dataclass
 class DynamicTableDefinition:
-    """Parsed dynamic table definition."""
+    """Dynamic table definition."""
 
     name: str
     schema_name: str
     query_sql: str
-    target_lag: str
     source_tables: List[str]
-    group_by_columns: List[str]
-    refresh_strategy: str = "AFFECTED_KEYS"
-    deduplicate: bool = False
-    cardinality_threshold: float = 0.3
 
-
-class DDLParser:
-    """Parser for CREATE DYNAMIC TABLE statements."""
-
-    # Simple regex pattern for CREATE DYNAMIC TABLE
-    # Format: CREATE DYNAMIC TABLE [schema.]name
-    #         TARGET_LAG = 'interval'
-    #         [REFRESH_STRATEGY = 'strategy']
-    #         [DEDUPLICATE = true|false]
-    #         [CARDINALITY_THRESHOLD = 0.3]
-    #         AS query
-
-    @staticmethod
-    def parse(ddl: str) -> DynamicTableDefinition:
-        """Parse CREATE DYNAMIC TABLE DDL.
+    @classmethod
+    def create(cls, name: str, schema_name: str, query_sql: str) -> "DynamicTableDefinition":
+        """Create a dynamic table definition with auto-extracted source tables.
 
         Args:
-            ddl: DDL statement
+            name: Table name
+            schema_name: Schema name
+            query_sql: SQL query
 
         Returns:
-            Parsed table definition
-
-        Raises:
-            ValueError: If DDL is invalid
+            DynamicTableDefinition instance
         """
-        # Normalize whitespace
-        ddl = " ".join(ddl.split())
-
-        # Extract table name
-        # Match: CREATE DYNAMIC TABLE [IF NOT EXISTS] [schema.]table
-        name_match = re.search(
-            r"CREATE\s+DYNAMIC\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:(\w+)\.(\w+)|(\w+))",
-            ddl,
-            re.IGNORECASE,
-        )
-        if not name_match:
-            raise ValueError("Invalid CREATE DYNAMIC TABLE syntax: missing table name")
-
-        if name_match.group(1) and name_match.group(2):
-            schema_name = name_match.group(1)
-            table_name = name_match.group(2)
-        else:
-            # Default to 'main' schema - this is DuckDB's default schema
-            schema_name = "main"
-            table_name = name_match.group(3)
-
-        # Extract TARGET_LAG
-        lag_match = re.search(r"TARGET_LAG\s*=\s*'([^']+)'", ddl, re.IGNORECASE)
-        if not lag_match:
-            raise ValueError("TARGET_LAG is required")
-        target_lag = lag_match.group(1)
-
-        # Extract optional parameters
-        strategy_match = re.search(r"REFRESH_STRATEGY\s*=\s*'(\w+)'", ddl, re.IGNORECASE)
-        refresh_strategy = strategy_match.group(1) if strategy_match else "AFFECTED_KEYS"
-
-        dedup_match = re.search(r"DEDUPLICATE\s*=\s*(true|false)", ddl, re.IGNORECASE)
-        deduplicate = dedup_match.group(1).lower() == "true" if dedup_match else False
-
-        threshold_match = re.search(r"CARDINALITY_THRESHOLD\s*=\s*([\d.]+)", ddl, re.IGNORECASE)
-        cardinality_threshold = float(threshold_match.group(1)) if threshold_match else 0.3
-
-        # Extract query after AS
-        as_match = re.search(r"\bAS\s+(.+)$", ddl, re.IGNORECASE | re.DOTALL)
-        if not as_match:
-            raise ValueError("Missing AS clause with query")
-        query_sql = as_match.group(1).strip()
-
-        # Parse query to extract source tables and GROUP BY columns
-        source_tables = DDLParser._extract_source_tables(query_sql)
-        group_by_columns = DDLParser._extract_group_by_columns(query_sql)
-
-        return DynamicTableDefinition(
-            name=table_name,
+        source_tables = extract_source_tables(query_sql)
+        return cls(
+            name=name,
             schema_name=schema_name,
             query_sql=query_sql,
-            target_lag=target_lag,
             source_tables=source_tables,
-            group_by_columns=group_by_columns,
-            refresh_strategy=refresh_strategy,
-            deduplicate=deduplicate,
-            cardinality_threshold=cardinality_threshold,
         )
-
-    @staticmethod
-    def _extract_source_tables(query: str) -> List[str]:
-        """Extract source table names from query.
-
-        Args:
-            query: SQL query
-
-        Returns:
-            List of table names (schema.table format if schema is specified)
-        """
-        try:
-            parsed = sqlglot.parse_one(query, read="duckdb")
-            tables = set()
-
-            for table in parsed.find_all(exp.Table):
-                table_name = table.name
-                # Include schema if present, otherwise just table name
-                if table.catalog:
-                    tables.add(f"{table.catalog}.{table_name}")
-                else:
-                    tables.add(table_name)
-
-            return sorted(tables)
-        except Exception as e:
-            raise ValueError(f"Failed to parse query: {e}")
-
-    @staticmethod
-    def _extract_group_by_columns(query: str) -> List[str]:
-        """Extract GROUP BY columns from query.
-
-        Args:
-            query: SQL query
-
-        Returns:
-            List of column names
-        """
-        try:
-            parsed = sqlglot.parse_one(query, read="duckdb")
-            group_by = parsed.find(exp.Group)
-
-            if not group_by:
-                return []
-
-            columns = []
-            for expr in group_by.expressions:
-                if isinstance(expr, exp.Column):
-                    columns.append(expr.name)
-                else:
-                    # For expressions, use the SQL representation
-                    columns.append(expr.sql())
-
-            return columns
-        except Exception as e:
-            raise ValueError(f"Failed to parse query: {e}")
 
 
 class DependencyGraph:

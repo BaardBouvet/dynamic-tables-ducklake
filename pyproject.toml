@@ -11,24 +11,17 @@ requires-python = ">=3.11"
 dependencies = [
     "duckdb>=0.10.0",
     "sqlglot>=21.0.0",
-    "click>=8.1.0",
-    "pyyaml>=6.0",
-    "minio>=7.2.0",
     "psycopg2-binary>=2.9.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.4.0",
-    "pytest-asyncio>=0.21.0",
     "testcontainers>=3.7.0",
-    "black>=23.0.0",
+    "minio>=7.2.0",
     "ruff>=0.1.0",
     "mypy>=1.7.0",
 ]
-
-[project.scripts]
-dtable = "dynamic_tables.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dynamic_tables"]

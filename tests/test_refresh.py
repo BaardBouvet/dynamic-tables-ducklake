@@ -3,7 +3,7 @@
 from typing import Any, Iterator
 import pytest
 from dynamic_tables.refresh import DynamicTableRefresher
-from dynamic_tables.parser import DDLParser
+from dynamic_tables.parser import DynamicTableDefinition
 
 
 class TestDynamicTableRefresh:
@@ -54,36 +54,25 @@ class TestDynamicTableRefresh:
 
     def test_create_dynamic_table(self, refresher: Any, sample_source_data: Any) -> None:
         """Test creating a dynamic table."""
-        ddl = """
-        CREATE DYNAMIC TABLE sales_summary
-        TARGET_LAG = '5 minutes'
-        AS
-        SELECT product_id, SUM(amount) as total_sales
-        FROM sales
-        GROUP BY product_id
-        """
-
-        definition = DDLParser.parse(ddl)
+        definition = DynamicTableDefinition.create(
+            name="sales_summary",
+            schema_name="main",
+            query_sql="SELECT product_id, SUM(amount) as total_sales FROM sales GROUP BY product_id",
+        )
         refresher.create_dynamic_table(definition)
 
         # Verify it's in metadata
         tables = refresher.list_tables()
         assert len(tables) == 1
         assert tables[0]["name"] == "sales_summary"
-        assert tables[0]["status"] == "ACTIVE"
 
     def test_create_duplicate_table(self, refresher: Any, sample_source_data: Any) -> None:
         """Test that creating duplicate table raises error."""
-        ddl = """
-        CREATE DYNAMIC TABLE sales_summary
-        TARGET_LAG = '5 minutes'
-        AS
-        SELECT product_id, SUM(amount) as total_sales
-        FROM sales
-        GROUP BY product_id
-        """
-
-        definition = DDLParser.parse(ddl)
+        definition = DynamicTableDefinition.create(
+            name="sales_summary",
+            schema_name="main",
+            query_sql="SELECT product_id, SUM(amount) as total_sales FROM sales GROUP BY product_id",
+        )
         refresher.create_dynamic_table(definition)
 
         # Try to create again
@@ -93,41 +82,28 @@ class TestDynamicTableRefresh:
     def test_create_circular_dependency(self, refresher: Any, sample_source_data: Any) -> None:
         """Test that circular dependencies are detected."""
         # Create table A depending on B
-        ddl_a = """
-        CREATE DYNAMIC TABLE table_a
-        TARGET_LAG = '5 minutes'
-        AS
-        SELECT * FROM table_b
-        """
-
-        definition_a = DDLParser.parse(ddl_a)
+        definition_a = DynamicTableDefinition.create(
+            name="table_a", schema_name="main", query_sql="SELECT * FROM table_b"
+        )
         refresher.create_dynamic_table(definition_a)
 
         # Try to create table B depending on A (cycle!)
-        ddl_b = """
-        CREATE DYNAMIC TABLE table_b
-        TARGET_LAG = '5 minutes'
-        AS
-        SELECT * FROM table_a
-        """
-
-        definition_b = DDLParser.parse(ddl_b)
+        definition_b = DynamicTableDefinition.create(
+            name="table_b", schema_name="main", query_sql="SELECT * FROM table_a"
+        )
         with pytest.raises(ValueError, match="Circular dependency"):
             refresher.create_dynamic_table(definition_b)
 
-    def test_refresh_single_table(self, refresher: Any, duckdb_conn: Any, sample_source_data: Any) -> None:
+    def test_refresh_single_table(
+        self, refresher: Any, duckdb_conn: Any, sample_source_data: Any
+    ) -> None:
         """Test full refresh of a single table."""
         # Create dynamic table
-        ddl = """
-        CREATE DYNAMIC TABLE sales_summary
-        TARGET_LAG = '5 minutes'
-        AS
-        SELECT product_id, SUM(amount) as total_sales, COUNT(*) as sale_count
-        FROM sales
-        GROUP BY product_id
-        """
-
-        definition = DDLParser.parse(ddl)
+        definition = DynamicTableDefinition.create(
+            name="sales_summary",
+            schema_name="main",
+            query_sql="SELECT product_id, SUM(amount) as total_sales, COUNT(*) as sale_count FROM sales GROUP BY product_id",
+        )
         refresher.create_dynamic_table(definition)
 
         # Perform refresh
@@ -152,16 +128,11 @@ class TestDynamicTableRefresh:
         self, refresher: Any, duckdb_conn: Any, sample_source_data: Any
     ) -> None:
         """Test that refresh replaces existing data."""
-        ddl = """
-        CREATE DYNAMIC TABLE sales_summary
-        TARGET_LAG = '5 minutes'
-        AS
-        SELECT product_id, SUM(amount) as total_sales
-        FROM sales
-        GROUP BY product_id
-        """
-
-        definition = DDLParser.parse(ddl)
+        definition = DynamicTableDefinition.create(
+            name="sales_summary",
+            schema_name="main",
+            query_sql="SELECT product_id, SUM(amount) as total_sales FROM sales GROUP BY product_id",
+        )
         refresher.create_dynamic_table(definition)
 
         # First refresh
@@ -199,28 +170,22 @@ class TestDynamicTableRefresh:
     ) -> None:
         """Test refreshing multiple tables in dependency order."""
         # Create first dynamic table
-        ddl1 = """
-        CREATE DYNAMIC TABLE sales_by_product
-        TARGET_LAG = '5 minutes'
-        AS
-        SELECT product_id, SUM(amount) as total
-        FROM sales
-        GROUP BY product_id
-        """
-
-        refresher.create_dynamic_table(DDLParser.parse(ddl1))
+        refresher.create_dynamic_table(
+            DynamicTableDefinition.create(
+                name="sales_by_product",
+                schema_name="main",
+                query_sql="SELECT product_id, SUM(amount) as total FROM sales GROUP BY product_id",
+            )
+        )
 
         # Create second dynamic table depending on first
-        ddl2 = """
-        CREATE DYNAMIC TABLE top_products
-        TARGET_LAG = '10 minutes'
-        AS
-        SELECT product_id, total
-        FROM sales_by_product
-        WHERE total > 200
-        """
-
-        refresher.create_dynamic_table(DDLParser.parse(ddl2))
+        refresher.create_dynamic_table(
+            DynamicTableDefinition.create(
+                name="top_products",
+                schema_name="main",
+                query_sql="SELECT product_id, total FROM sales_by_product WHERE total > 200",
+            )
+        )
 
         # Refresh all tables
         results = refresher.refresh_tables()
@@ -248,16 +213,13 @@ class TestDynamicTableRefresh:
 
     def test_drop_table(self, refresher: Any, duckdb_conn: Any, sample_source_data: Any) -> None:
         """Test dropping a dynamic table."""
-        ddl = """
-        CREATE DYNAMIC TABLE sales_summary
-        TARGET_LAG = '5 minutes'
-        AS
-        SELECT product_id, SUM(amount) as total
-        FROM sales
-        GROUP BY product_id
-        """
-
-        refresher.create_dynamic_table(DDLParser.parse(ddl))
+        refresher.create_dynamic_table(
+            DynamicTableDefinition.create(
+                name="sales_summary",
+                schema_name="main",
+                query_sql="SELECT product_id, SUM(amount) as total FROM sales GROUP BY product_id",
+            )
+        )
         refresher.refresh_tables(["sales_summary"])
 
         # Drop the table
@@ -280,24 +242,18 @@ class TestDynamicTableRefresh:
     ) -> None:
         """Test that dropping a table with dependents fails."""
         # Create parent table
-        ddl1 = """
-        CREATE DYNAMIC TABLE parent_table
-        TARGET_LAG = '5 minutes'
-        AS
-        SELECT * FROM sales
-        """
-
-        refresher.create_dynamic_table(DDLParser.parse(ddl1))
+        refresher.create_dynamic_table(
+            DynamicTableDefinition.create(
+                name="parent_table", schema_name="main", query_sql="SELECT * FROM sales"
+            )
+        )
 
         # Create child table
-        ddl2 = """
-        CREATE DYNAMIC TABLE child_table
-        TARGET_LAG = '5 minutes'
-        AS
-        SELECT * FROM parent_table
-        """
-
-        refresher.create_dynamic_table(DDLParser.parse(ddl2))
+        refresher.create_dynamic_table(
+            DynamicTableDefinition.create(
+                name="child_table", schema_name="main", query_sql="SELECT * FROM parent_table"
+            )
+        )
 
         # Try to drop parent
         with pytest.raises(ValueError, match="depend on it"):
@@ -305,16 +261,13 @@ class TestDynamicTableRefresh:
 
     def test_refresh_history_recorded(self, refresher: Any, sample_source_data: Any) -> None:
         """Test that refresh history is properly recorded."""
-        ddl = """
-        CREATE DYNAMIC TABLE sales_summary
-        TARGET_LAG = '5 minutes'
-        AS
-        SELECT product_id, SUM(amount) as total
-        FROM sales
-        GROUP BY product_id
-        """
-
-        refresher.create_dynamic_table(DDLParser.parse(ddl))
+        refresher.create_dynamic_table(
+            DynamicTableDefinition.create(
+                name="sales_summary",
+                schema_name="main",
+                query_sql="SELECT product_id, SUM(amount) as total FROM sales GROUP BY product_id",
+            )
+        )
         refresher.refresh_tables(["sales_summary"])
 
         # Check history
@@ -344,16 +297,13 @@ class TestDynamicTableRefresh:
             LIMIT 1
         """).fetchone()[0]
 
-        ddl = """
-        CREATE DYNAMIC TABLE sales_summary
-        TARGET_LAG = '5 minutes'
-        AS
-        SELECT product_id, SUM(amount) as total
-        FROM sales
-        GROUP BY product_id
-        """
-
-        refresher.create_dynamic_table(DDLParser.parse(ddl))
+        refresher.create_dynamic_table(
+            DynamicTableDefinition.create(
+                name="sales_summary",
+                schema_name="main",
+                query_sql="SELECT product_id, SUM(amount) as total FROM sales GROUP BY product_id",
+            )
+        )
         refresher.refresh_tables(["sales_summary"])
 
         # Verify snapshots were captured in source_snapshots table
@@ -390,29 +340,23 @@ class TestDynamicTableRefresh:
     ) -> None:
         """Test that snapshots are tracked for dynamic tables that depend on other dynamic tables."""
         # Create first-level dynamic table
-        ddl1 = """
-        CREATE DYNAMIC TABLE sales_summary
-        TARGET_LAG = '5 minutes'
-        AS
-        SELECT product_id, SUM(amount) as total
-        FROM sales
-        GROUP BY product_id
-        """
-
-        refresher.create_dynamic_table(DDLParser.parse(ddl1))
+        refresher.create_dynamic_table(
+            DynamicTableDefinition.create(
+                name="sales_summary",
+                schema_name="main",
+                query_sql="SELECT product_id, SUM(amount) as total FROM sales GROUP BY product_id",
+            )
+        )
         refresher.refresh_tables(["sales_summary"])
 
         # Create second-level dynamic table that depends on sales_summary
-        ddl2 = """
-        CREATE DYNAMIC TABLE high_value_products
-        TARGET_LAG = '5 minutes'
-        AS
-        SELECT product_id
-        FROM sales_summary
-        WHERE total > 200
-        """
-
-        refresher.create_dynamic_table(DDLParser.parse(ddl2))
+        refresher.create_dynamic_table(
+            DynamicTableDefinition.create(
+                name="high_value_products",
+                schema_name="main",
+                query_sql="SELECT product_id FROM sales_summary WHERE total > 200",
+            )
+        )
         refresher.refresh_tables(["high_value_products"])
 
         # Verify that high_value_products has snapshots for both sales_summary and sales
@@ -430,11 +374,9 @@ class TestDynamicTableRefresh:
         assert snapshots[0][0] == "sales"
         assert snapshots[1][0] == "sales_summary"
 
-    def test_snapshot_isolation_in_dependency_chain(
-        self, refresher: Any, duckdb_conn: Any
-    ) -> None:
+    def test_snapshot_isolation_in_dependency_chain(self, refresher: Any, duckdb_conn: Any) -> None:
         """Test that snapshot isolation ensures consistency in dependency chains.
-        
+
         Scenario: C depends on both A and B, where B also depends on A.
         When C refreshes, it must read A at the same snapshot that B used,
         otherwise the data from A and B could be inconsistent.
@@ -449,41 +391,44 @@ class TestDynamicTableRefresh:
         duckdb_conn.execute("INSERT INTO orders VALUES (1, 100), (2, 200)")
 
         # Create dynamic table B that depends on A
-        ddl_b = """
-        CREATE DYNAMIC TABLE order_summary
-        TARGET_LAG = '5 minutes'
-        AS
-        SELECT COUNT(*) as order_count, SUM(amount) as total_amount
-        FROM orders
-        """
-        refresher.create_dynamic_table(DDLParser.parse(ddl_b))
+        refresher.create_dynamic_table(
+            DynamicTableDefinition.create(
+                name="order_summary",
+                schema_name="main",
+                query_sql="SELECT COUNT(*) as order_count, SUM(amount) as total_amount FROM orders",
+            )
+        )
         refresher.refresh_tables(["order_summary"])
 
         # Verify B's results
-        result_b = duckdb_conn.execute("SELECT order_count, total_amount FROM order_summary").fetchone()
+        result_b = duckdb_conn.execute(
+            "SELECT order_count, total_amount FROM order_summary"
+        ).fetchone()
         assert result_b[0] == 2  # 2 orders
         assert result_b[1] == 300  # 100 + 200
 
         # Now create dynamic table C that depends on both A and B
-        ddl_c = """
-        CREATE DYNAMIC TABLE order_validation
-        TARGET_LAG = '5 minutes'
-        AS
-        SELECT 
-            os.order_count,
-            os.total_amount,
-            COUNT(*) as actual_count,
-            SUM(o.amount) as actual_amount
-        FROM order_summary os
-        CROSS JOIN orders o
-        GROUP BY os.order_count, os.total_amount
-        """
-        refresher.create_dynamic_table(DDLParser.parse(ddl_c))
-        
+        refresher.create_dynamic_table(
+            DynamicTableDefinition.create(
+                name="order_validation",
+                schema_name="main",
+                query_sql="""
+                SELECT 
+                    os.order_count,
+                    os.total_amount,
+                    COUNT(*) as actual_count,
+                    SUM(o.amount) as actual_amount
+                FROM order_summary os
+                CROSS JOIN orders o
+                GROUP BY os.order_count, os.total_amount
+            """,
+            )
+        )
+
         # Insert more data into A BEFORE refreshing C
         # This creates the scenario where A has progressed but B hasn't been refreshed yet
         duckdb_conn.execute("INSERT INTO orders VALUES (3, 300)")
-        
+
         # Refresh C - it should use the SAME snapshot of A that B used,
         # not the current state of A
         refresher.refresh_tables(["order_validation"])
@@ -494,14 +439,17 @@ class TestDynamicTableRefresh:
             SELECT order_count, total_amount, actual_count, actual_amount 
             FROM order_validation
         """).fetchone()
-        
+
         # If snapshot isolation works correctly:
         # - order_count and total_amount come from B (2, 300)
         # - actual_count and actual_amount come from A at the SAME snapshot B used (2, 300)
         # So they should match
-        assert result_c[0] == result_c[2], "order_count should match actual_count (snapshot isolation)"
-        assert result_c[1] == result_c[3], "total_amount should match actual_amount (snapshot isolation)"
-        
+        assert result_c[0] == result_c[2], (
+            "order_count should match actual_count (snapshot isolation)"
+        )
+        assert result_c[1] == result_c[3], (
+            "total_amount should match actual_amount (snapshot isolation)"
+        )
+
         # Cleanup
         duckdb_conn.execute("DROP TABLE IF EXISTS orders")
-

@@ -10,25 +10,14 @@ METADATA_SCHEMA = """
 
 CREATE TABLE IF NOT EXISTS dynamic_tables (
     name VARCHAR PRIMARY KEY,
-    schema_name VARCHAR DEFAULT 'dynamic',
-    query_sql TEXT NOT NULL,
-    target_lag INTERVAL NOT NULL,
-    group_by_columns TEXT[],
-    refresh_strategy VARCHAR DEFAULT 'AFFECTED_KEYS',
-    deduplicate BOOLEAN DEFAULT FALSE,
-    cardinality_threshold FLOAT DEFAULT 0.3,
-    status VARCHAR DEFAULT 'ACTIVE',  -- ACTIVE, PAUSED, FAILED
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
+    schema_name VARCHAR NOT NULL,
+    query_sql TEXT NOT NULL
 );
-
-CREATE INDEX IF NOT EXISTS idx_tables_status ON dynamic_tables(status);
 
 CREATE TABLE IF NOT EXISTS source_snapshots (
     dynamic_table VARCHAR,
     source_table VARCHAR,
     last_snapshot BIGINT NOT NULL,
-    last_processed_at TIMESTAMP DEFAULT NOW(),
     PRIMARY KEY (dynamic_table, source_table),
     FOREIGN KEY (dynamic_table) REFERENCES dynamic_tables(name) ON DELETE CASCADE
 );

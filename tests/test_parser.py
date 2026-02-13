@@ -1,121 +1,47 @@
-"""Test DDL parser and dependency management."""
+"""Test dependency management and source table extraction."""
 
 import pytest
-from dynamic_tables.parser import DDLParser, DependencyGraph
+from dynamic_tables.parser import DependencyGraph, extract_source_tables
 
 
-class TestDDLParser:
-    """Test DDL parsing."""
+class TestExtractSourceTables:
+    """Test source table extraction from SQL queries."""
 
-    def test_parse_simple_table(self) -> None:
-        """Test parsing a simple dynamic table."""
-        ddl = """
-        CREATE DYNAMIC TABLE sales_summary
-        TARGET_LAG = '5 minutes'
-        AS
-        SELECT product_id, SUM(amount) as total_sales
-        FROM sales
-        GROUP BY product_id
-        """
+    def test_extract_single_table(self) -> None:
+        """Test extracting a single source table."""
+        query = "SELECT * FROM sales"
+        tables = extract_source_tables(query)
 
-        definition = DDLParser.parse(ddl)
+        assert tables == ["sales"]
 
-        assert definition.name == "sales_summary"
-        assert definition.schema_name == "main"
-        assert definition.target_lag == "5 minutes"
-        assert "sales" in definition.source_tables
-        assert "product_id" in definition.group_by_columns
-        assert definition.refresh_strategy == "AFFECTED_KEYS"
-        assert definition.deduplicate is False
-
-    def test_parse_with_schema(self) -> None:
-        """Test parsing table with explicit schema."""
-        ddl = """
-        CREATE DYNAMIC TABLE analytics.daily_metrics
-        TARGET_LAG = '1 hour'
-        AS
-        SELECT date, COUNT(*) as count FROM events GROUP BY date
-        """
-
-        definition = DDLParser.parse(ddl)
-
-        assert definition.name == "daily_metrics"
-        assert definition.schema_name == "analytics"
-
-    def test_parse_with_options(self) -> None:
-        """Test parsing with all options."""
-        ddl = """
-        CREATE DYNAMIC TABLE user_stats
-        TARGET_LAG = '10 minutes'
-        REFRESH_STRATEGY = 'FULL'
-        DEDUPLICATE = true
-        CARDINALITY_THRESHOLD = 0.5
-        AS
-        SELECT user_id, COUNT(*) FROM actions GROUP BY user_id
-        """
-
-        definition = DDLParser.parse(ddl)
-
-        assert definition.refresh_strategy == "FULL"
-        assert definition.deduplicate is True
-        assert definition.cardinality_threshold == 0.5
-
-    def test_parse_multiple_sources(self) -> None:
-        """Test extracting multiple source tables."""
-        ddl = """
-        CREATE DYNAMIC TABLE order_summary
-        TARGET_LAG = '5 minutes'
-        AS
+    def test_extract_multiple_tables_join(self) -> None:
+        """Test extracting multiple tables from a join."""
+        query = """
         SELECT o.id, c.name, SUM(oi.amount) as total
         FROM orders o
         JOIN customers c ON o.customer_id = c.id
         JOIN order_items oi ON o.id = oi.order_id
         GROUP BY o.id, c.name
         """
+        tables = extract_source_tables(query)
 
-        definition = DDLParser.parse(ddl)
+        assert sorted(tables) == ["customers", "order_items", "orders"]
 
-        assert len(definition.source_tables) == 3
-        assert "orders" in definition.source_tables
-        assert "customers" in definition.source_tables
-        assert "order_items" in definition.source_tables
+    def test_extract_with_schema(self) -> None:
+        """Test extracting tables with schema qualification."""
+        query = "SELECT * FROM analytics.events JOIN main.users ON events.user_id = users.id"
+        tables = extract_source_tables(query)
 
-    def test_parse_missing_target_lag(self) -> None:
-        """Test that missing TARGET_LAG raises error."""
-        ddl = """
-        CREATE DYNAMIC TABLE bad_table
-        AS
-        SELECT * FROM sales
-        """
+        assert "analytics.events" in tables
+        assert "main.users" in tables
 
-        with pytest.raises(ValueError, match="TARGET_LAG is required"):
-            DDLParser.parse(ddl)
+    def test_extract_from_subquery(self) -> None:
+        """Test extracting tables from query with subquery."""
+        query = "SELECT * FROM (SELECT * FROM sales) s JOIN customers c ON s.customer_id = c.id"
+        tables = extract_source_tables(query)
 
-    def test_parse_missing_query(self) -> None:
-        """Test that missing AS clause raises error."""
-        ddl = """
-        CREATE DYNAMIC TABLE bad_table
-        TARGET_LAG = '5 minutes'
-        """
-
-        with pytest.raises(ValueError, match="Missing AS clause"):
-            DDLParser.parse(ddl)
-
-    def test_extract_group_by_expressions(self) -> None:
-        """Test extracting complex GROUP BY expressions."""
-        ddl = """
-        CREATE DYNAMIC TABLE daily_sales
-        TARGET_LAG = '1 hour'
-        AS
-        SELECT DATE_TRUNC('day', created_at) as day, SUM(amount)
-        FROM sales
-        GROUP BY DATE_TRUNC('day', created_at)
-        """
-
-        definition = DDLParser.parse(ddl)
-
-        # Should capture the expression
-        assert len(definition.group_by_columns) > 0
+        assert "sales" in tables
+        assert "customers" in tables
 
 
 class TestDependencyGraph:
