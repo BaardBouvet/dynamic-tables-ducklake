@@ -102,6 +102,103 @@ class DynamicTableRefresher:
 
         self.metadata.conn.commit()
 
+    def _extract_group_by_keys(self, query_sql: str) -> List[str]:
+        """Extract GROUP BY column names from a query.
+
+        Args:
+            query_sql: SQL query to analyze
+
+        Returns:
+            List of GROUP BY column names (empty list if no GROUP BY)
+        """
+        try:
+            parsed = sqlglot.parse_one(query_sql, dialect="duckdb")
+
+            # Find the GROUP BY clause
+            group_by = parsed.find(exp.Group)
+            if not group_by:
+                return []
+
+            # Extract column names from GROUP BY expressions
+            keys = []
+            for expr in group_by.expressions:
+                # Handle simple column references
+                if isinstance(expr, exp.Column):
+                    keys.append(expr.name)
+                # Handle positioned GROUP BY (e.g., GROUP BY 1, 2)
+                elif isinstance(expr, exp.Literal):
+                    # For now, skip positional references (would need column list)
+                    pass
+                else:
+                    # For complex expressions, use the SQL text
+                    keys.append(expr.sql(dialect="duckdb"))
+
+            return keys
+
+        except Exception:
+            # If we can't parse, return empty list (will fall back to full refresh)
+            return []
+
+    def _get_affected_keys(
+        self,
+        source_table: str,
+        old_snapshot: int,
+        new_snapshot: int,
+        group_by_keys: List[str],
+    ) -> str:
+        """Generate SQL to extract affected keys from CDC changes.
+
+        Args:
+            source_table: Name of the source table
+            old_snapshot: Previous snapshot ID
+            new_snapshot: Current snapshot ID
+            group_by_keys: List of GROUP BY column names
+
+        Returns:
+            SQL query that selects DISTINCT affected keys
+        """
+        # Build the DISTINCT key selection
+        key_columns = ", ".join(group_by_keys)
+
+        # Use table_changes() to get both preimage and postimage
+        # We need to extract keys from BOTH to catch all affected groups
+        return f"""
+            SELECT DISTINCT {key_columns}
+            FROM table_changes('{source_table}', {old_snapshot}, {new_snapshot})
+            WHERE change_type IN ('update_preimage', 'update_postimage', 'insert', 'delete')
+        """
+
+    def _should_use_incremental(
+        self,
+        table_name: str,
+        source_snapshots: Dict[str, int],
+        query_sql: str,
+    ) -> bool:
+        """Decide whether to use incremental or full refresh strategy.
+
+        Args:
+            table_name: Name of the dynamic table
+            source_snapshots: Map of source table -> last snapshot used
+            query_sql: The query SQL
+
+        Returns:
+            True if incremental refresh should be used, False for full refresh
+        """
+        # If no prior snapshots, this is bootstrap - use full refresh
+        if not source_snapshots:
+            return False
+
+        # Extract GROUP BY keys
+        group_by_keys = self._extract_group_by_keys(query_sql)
+
+        # If no GROUP BY, can't do incremental
+        if not group_by_keys:
+            return False
+
+        # For Phase 2 simplicity: always try incremental if GROUP BY exists
+        # Phase 3 will add cardinality checks (>30% affected → full refresh)
+        return True
+
     def _rewrite_query_with_snapshots(self, query_sql: str, snapshot_map: Dict[str, int]) -> str:
         """Rewrite query to use FOR SYSTEM_TIME AS OF SNAPSHOT clauses.
 
@@ -201,6 +298,17 @@ class DynamicTableRefresher:
         direct_dependencies = [row[0] for row in cursor.fetchall()]
         snapshots_to_use = {}
 
+        # Get previous snapshots (if any) for incremental refresh decision
+        cursor.execute(
+            """
+            SELECT source_table, last_snapshot
+            FROM source_snapshots
+            WHERE dynamic_table = %s
+        """,
+            (table_name,),
+        )
+        previous_snapshots = {row[0]: row[1] for row in cursor.fetchall()}
+
         # Inherit snapshots from dynamic table dependencies
         for dep in direct_dependencies:
             cursor.execute("SELECT name FROM dynamic_tables WHERE name = %s", (dep,))
@@ -223,6 +331,12 @@ class DynamicTableRefresher:
             if dep not in snapshots_to_use:
                 snapshots_to_use[dep] = batch_snapshot
 
+        # Decide on refresh strategy
+        use_incremental = self._should_use_incremental(
+            table_name, previous_snapshots, query_sql
+        )
+        strategy = "INCREMENTAL" if use_incremental else "FULL"
+
         # Rewrite query with snapshot isolation
         query_with_snapshots = self._rewrite_query_with_snapshots(query_sql, snapshots_to_use)
 
@@ -235,10 +349,10 @@ class DynamicTableRefresher:
             """
             INSERT INTO refresh_history (
                 dynamic_table, started_at, status, strategy_used, source_snapshots
-            ) VALUES (%s, %s, 'RUNNING', 'FULL', %s)
+            ) VALUES (%s, %s, 'RUNNING', %s, %s)
             RETURNING id
         """,
-            (table_name, started_at, json.dumps(snapshots_to_use)),
+            (table_name, started_at, strategy, json.dumps(snapshots_to_use)),
         )
 
         result = cursor.fetchone()
@@ -248,7 +362,7 @@ class DynamicTableRefresher:
         self.metadata.conn.commit()
 
         try:
-            # Full refresh: TRUNCATE + INSERT
+            # Full table name with schema
             full_table_name = f"{schema_name}.{table_name}" if schema_name != "main" else table_name
 
             # Check if table exists
@@ -261,10 +375,7 @@ class DynamicTableRefresher:
                 > 0
             )
 
-            if table_exists:
-                # Delete existing data
-                self.duckdb.execute(f"DELETE FROM {full_table_name}")
-            else:
+            if not table_exists:
                 # Create table from query (DDL - outside transaction)
                 # Use original query for schema inference, not snapshot query
                 self.duckdb.execute(f"""
@@ -274,16 +385,88 @@ class DynamicTableRefresher:
                     ) LIMIT 0
                 """)
 
-            # Insert data using snapshot-isolated query
-            self.duckdb.execute(f"""
-                INSERT INTO {full_table_name}
-                {query_with_snapshots}
-            """)
+            if use_incremental:
+                # INCREMENTAL REFRESH: Use affected keys strategy
+                group_by_keys = self._extract_group_by_keys(query_sql)
 
-            # Get row count
-            rows_affected = self.duckdb.execute(
-                f"SELECT COUNT(*) FROM {full_table_name}"
-            ).fetchone()[0]
+                # Create TEMP table to accumulate ALL affected keys across all source tables
+                key_columns = ", ".join(group_by_keys)
+                
+                # Create temp table by selecting GROUP BY columns from the actual query
+                # This ensures we get the right column types
+                self.duckdb.execute(f"""
+                    CREATE TEMP TABLE IF NOT EXISTS affected_keys_{table_name} AS
+                    SELECT DISTINCT {key_columns}
+                    FROM ({query_with_snapshots}) sub
+                    WHERE FALSE
+                """)
+
+                # For each source table, get affected keys from CDC
+                for source_table, old_snapshot in previous_snapshots.items():
+                    new_snapshot = snapshots_to_use.get(source_table, old_snapshot)
+
+                    # Only process CDC if snapshot changed
+                    if new_snapshot > old_snapshot:
+                        affected_keys_query = self._get_affected_keys(
+                            source_table, old_snapshot, new_snapshot, group_by_keys
+                        )
+
+                        # Insert affected keys into temp table
+                        self.duckdb.execute(f"""
+                            INSERT INTO affected_keys_{table_name}
+                            {affected_keys_query}
+                        """)
+
+                # Delete old aggregates for affected keys
+                # Build WHERE clause: (key1, key2, ...) IN (SELECT key1, key2, ... FROM temp)
+                self.duckdb.execute(f"""
+                    DELETE FROM {full_table_name}
+                    WHERE ({key_columns}) IN (
+                        SELECT {key_columns} FROM affected_keys_{table_name}
+                    )
+                """)
+
+                # Recompute only affected keys
+                # Inject WHERE clause into the query to filter by affected keys
+                self.duckdb.execute(f"""
+                    INSERT INTO {full_table_name}
+                    SELECT * FROM (
+                        {query_with_snapshots}
+                    ) WHERE ({key_columns}) IN (
+                        SELECT {key_columns} FROM affected_keys_{table_name}
+                    )
+                """)
+
+                # Count affected keys
+                affected_keys_count = self.duckdb.execute(
+                    f"SELECT COUNT(*) FROM affected_keys_{table_name}"
+                ).fetchone()[0]
+
+                # Clean up temp table
+                self.duckdb.execute(f"DROP TABLE IF EXISTS affected_keys_{table_name}")
+
+                # Get affected row count (approximation - rows in final table)
+                rows_affected = self.duckdb.execute(
+                    f"SELECT COUNT(*) FROM {full_table_name}"
+                ).fetchone()[0]
+
+            else:
+                # FULL REFRESH: TRUNCATE + INSERT
+                affected_keys_count = None  # Not applicable for full refresh
+                if table_exists:
+                    # Delete existing data
+                    self.duckdb.execute(f"DELETE FROM {full_table_name}")
+
+                # Insert data using snapshot-isolated query
+                self.duckdb.execute(f"""
+                    INSERT INTO {full_table_name}
+                    {query_with_snapshots}
+                """)
+
+                # Get row count
+                rows_affected = self.duckdb.execute(
+                    f"SELECT COUNT(*) FROM {full_table_name}"
+                ).fetchone()[0]
 
             # Calculate duration
             duration_ms = int((time.time() - start_time) * 1000)
@@ -295,24 +478,12 @@ class DynamicTableRefresher:
                 SET completed_at = %s,
                     status = 'SUCCESS',
                     rows_affected = %s,
+                    affected_keys_count = %s,
                     duration_ms = %s
                 WHERE id = %s
             """,
-                (datetime.now(UTC), rows_affected, duration_ms, history_id),
+                (datetime.now(UTC), rows_affected, affected_keys_count, duration_ms, history_id),
             )
-
-            # Update source_snapshots table with the snapshots we used
-            for source_table, snapshot_id in snapshots_to_use.items():
-                cursor.execute(
-                    """
-                    INSERT INTO source_snapshots (dynamic_table, source_table, last_snapshot)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (dynamic_table, source_table)
-                    DO UPDATE SET 
-                        last_snapshot = EXCLUDED.last_snapshot
-                """,
-                    (table_name, source_table, snapshot_id),
-                )
 
             return {"status": "SUCCESS", "rows_affected": rows_affected, "duration_ms": duration_ms}
 
@@ -462,6 +633,73 @@ class DynamicTableRefresher:
 
             # Commit the entire batch
             self.duckdb.execute("COMMIT")
+
+            # Capture final snapshot AFTER commit - this is what we'll use for next refresh
+            result = self.duckdb.execute(
+                """
+                SELECT snapshot_id 
+                FROM ducklake.snapshots() 
+                ORDER BY snapshot_id DESC 
+                LIMIT 1
+            """
+            ).fetchone()
+
+            if result is None:
+                raise RuntimeError("No snapshots available after commit")
+
+            final_snapshot: int = int(result[0])
+
+            # Update source_snapshots to use the final snapshot (after commit)
+            # This ensures next refresh will see changes from this point forward
+            cursor = self.metadata.conn.cursor()
+            for table_name in tables_to_refresh:
+                # Get direct dependencies for this table
+                cursor.execute(
+                    """
+                    SELECT DISTINCT upstream
+                    FROM dependencies
+                    WHERE downstream = %s
+                """,
+                    (table_name,),
+                )
+                direct_dependencies = [row[0] for row in cursor.fetchall()]
+
+                # Track all source tables (both direct and inherited)
+                all_source_snapshots = {}
+
+                for dep in direct_dependencies:
+                    # Check if dependency is a dynamic table
+                    cursor.execute("SELECT name FROM dynamic_tables WHERE name = %s", (dep,))
+                    is_dynamic_table = cursor.fetchone() is not None
+
+                    if is_dynamic_table:
+                        # Inherit snapshots from dynamic table dependencies
+                        cursor.execute(
+                            """
+                            SELECT source_table, last_snapshot
+                            FROM source_snapshots
+                            WHERE dynamic_table = %s
+                        """,
+                            (dep,),
+                        )
+                        inherited_snapshots = {row[0]: row[1] for row in cursor.fetchall()}
+                        all_source_snapshots.update(inherited_snapshots)
+                    
+                    # Also track the dependency itself with final snapshot
+                    all_source_snapshots[dep] = final_snapshot
+
+                # Update source_snapshots with all tracked sources
+                for source_table, snapshot_id in all_source_snapshots.items():
+                    cursor.execute(
+                        """
+                        INSERT INTO source_snapshots (dynamic_table, source_table, last_snapshot)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (dynamic_table, source_table)
+                        DO UPDATE SET 
+                            last_snapshot = EXCLUDED.last_snapshot
+                    """,
+                        (table_name, source_table, snapshot_id),
+                    )
 
             # Commit all metadata changes
             self.metadata.conn.commit()

@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS refresh_history (
     status VARCHAR NOT NULL,  -- SUCCESS, FAILED
     strategy_used VARCHAR,  -- FULL, AFFECTED_KEYS
     rows_affected BIGINT,
+    affected_keys_count BIGINT,
     duration_ms BIGINT,
     error_message TEXT,
     source_snapshots JSONB,

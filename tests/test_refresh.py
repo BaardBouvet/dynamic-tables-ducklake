@@ -453,3 +453,118 @@ class TestDynamicTableRefresh:
 
         # Cleanup
         duckdb_conn.execute("DROP TABLE IF EXISTS orders")
+
+    def test_incremental_refresh_affected_keys(
+        self, refresher: Any, duckdb_conn: Any
+    ) -> None:
+        """Test incremental refresh using affected keys strategy (Phase 2).
+        
+        Simplest possible example:
+        1. Create source table with orders
+        2. Create dynamic table aggregating by customer_id
+        3. Do initial refresh (bootstrap - full refresh)
+        4. Update an order to change its customer_id
+        5. Do incremental refresh
+        6. Verify only affected customers were recomputed
+        """
+        # Create source table with orders
+        duckdb_conn.execute("DROP TABLE IF EXISTS orders")
+        duckdb_conn.execute("""
+            CREATE TABLE orders (
+                order_id INTEGER,
+                customer_id INTEGER,
+                amount DECIMAL(10,2)
+            )
+        """)
+        
+        # Insert initial data
+        duckdb_conn.execute("BEGIN TRANSACTION")
+        duckdb_conn.execute("""
+            INSERT INTO orders VALUES
+                (1, 100, 50.00),
+                (2, 100, 75.00),
+                (3, 200, 100.00),
+                (4, 300, 25.00)
+        """)
+        duckdb_conn.execute("COMMIT")
+        
+        # Create dynamic table that aggregates by customer_id
+        refresher.create_dynamic_table(
+            DynamicTableDefinition.create(
+                name="customer_metrics",
+                schema_name="main",
+                query_sql="""
+                    SELECT 
+                        customer_id,
+                        COUNT(*) as order_count,
+                        SUM(amount) as total_amount
+                    FROM orders
+                    GROUP BY customer_id
+                """,
+            )
+        )
+        
+        # Bootstrap: Initial full refresh
+        refresher.refresh_tables(["customer_metrics"])
+        
+        # Verify initial state
+        results = duckdb_conn.execute("""
+            SELECT customer_id, order_count, total_amount 
+            FROM customer_metrics 
+            ORDER BY customer_id
+        """).fetchall()
+        
+        assert len(results) == 3
+        assert results[0] == (100, 2, 125.00)  # 2 orders, $125 total
+        assert results[1] == (200, 1, 100.00)  # 1 order, $100 total
+        assert results[2] == (300, 1, 25.00)   # 1 order, $25 total
+        
+        # Now UPDATE order #2: change customer from 100 to 400
+        # This affects TWO customers: 100 (loses an order) and 400 (gains an order)
+        duckdb_conn.execute("BEGIN TRANSACTION")
+        duckdb_conn.execute("""
+            UPDATE orders 
+            SET customer_id = 400 
+            WHERE order_id = 2
+        """)
+        duckdb_conn.execute("COMMIT")
+        
+        # Incremental refresh - should only recompute customers 100 and 400
+        # (not customers 200 or 300)
+        refresher.refresh_tables(["customer_metrics"])
+        
+        # Verify updated state
+        results = duckdb_conn.execute("""
+            SELECT customer_id, order_count, total_amount 
+            FROM customer_metrics 
+            ORDER BY customer_id
+        """).fetchall()
+        
+        assert len(results) == 4
+        assert results[0] == (100, 1, 50.00)   # Lost order #2, now just order #1
+        assert results[1] == (200, 1, 100.00)  # Unchanged
+        assert results[2] == (300, 1, 25.00)   # Unchanged
+        assert results[3] == (400, 1, 75.00)   # Gained order #2
+        
+        # Verify that refresh strategy was INCREMENTAL (not FULL)
+        cursor = refresher.metadata.conn.cursor()
+        cursor.execute("""
+            SELECT strategy_used, affected_keys_count
+            FROM refresh_history 
+            WHERE dynamic_table = 'customer_metrics'
+            ORDER BY started_at DESC
+            LIMIT 1
+        """)
+        result = cursor.fetchone()
+        last_strategy = result[0]
+        affected_keys_count = result[1]
+        
+        assert last_strategy == "INCREMENTAL", (
+            "Second refresh should use INCREMENTAL strategy"
+        )
+        assert affected_keys_count == 2, (
+            "Should have exactly 2 affected keys: customer 100 (lost order) and 400 (gained order)"
+        )
+        
+        # Cleanup
+        duckdb_conn.execute("DROP TABLE IF EXISTS orders")
