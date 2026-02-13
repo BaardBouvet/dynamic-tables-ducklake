@@ -171,13 +171,14 @@ class DynamicTableRefresher:
             # If parsing fails, raise error - we cannot proceed without snapshot isolation
             raise RuntimeError(f"Failed to rewrite query with snapshot isolation: {e}") from e
 
-    def refresh_table(self, table_name: str, auto_commit: bool = True, batch_snapshot: int | None = None) -> Dict[str, Any]:
-        """Perform full refresh of a dynamic table.
+    def _refresh_single_table(self, table_name: str, batch_snapshot: int | None) -> Dict[str, Any]:
+        """Internal method to refresh a single table within a transaction.
+        
+        Caller is responsible for transaction management (BEGIN/COMMIT/ROLLBACK).
 
         Args:
             table_name: Name of table to refresh
-            auto_commit: If True, manage own transaction. If False, caller manages transaction.
-            batch_snapshot: If provided, use this snapshot for all base tables (batch mode)
+            batch_snapshot: Snapshot to use for all base tables (None = capture current)
 
         Returns:
             Refresh metrics (rows_affected, duration_ms, etc.)
@@ -203,13 +204,7 @@ class DynamicTableRefresher:
 
         query_sql, schema_name = row
 
-        # For snapshot isolation, we need to determine which snapshots to use for each source table
-        # Strategy:
-        # 1. For each direct dependency that's a dynamic table, inherit the snapshots it used
-        # 2. For remaining dependencies (base tables or dynamic tables themselves), use current snapshot
-        # 3. This ensures consistency: if C depends on B and A, and B depends on A,
-        #    then C reads A at the same snapshot that B used
-        
+        # Get direct dependencies
         cursor.execute(
             """
             SELECT DISTINCT upstream
@@ -222,12 +217,8 @@ class DynamicTableRefresher:
         direct_dependencies = [row[0] for row in cursor.fetchall()]
         snapshots_to_use = {}
         
-        # First pass: inherit snapshots from dynamic table dependencies
-        # Also detect conflicts where multiple dependencies used different snapshots
-        snapshot_sources: dict[str, dict[str, int]] = {}  # source_table -> {dep_table -> snapshot_id}
-        
+        # Inherit snapshots from dynamic table dependencies
         for dep in direct_dependencies:
-            # Check if this dependency is a dynamic table
             cursor.execute(
                 "SELECT name FROM dynamic_tables WHERE name = %s",
                 (dep,)
@@ -235,7 +226,6 @@ class DynamicTableRefresher:
             is_dynamic_table = cursor.fetchone() is not None
             
             if is_dynamic_table:
-                # Use the snapshots that this dynamic table used
                 cursor.execute(
                     """
                     SELECT source_table, last_snapshot
@@ -245,85 +235,9 @@ class DynamicTableRefresher:
                     (dep,)
                 )
                 dep_snapshots = {row[0]: row[1] for row in cursor.fetchall()}
-                
-                # Track which dependency used which snapshot for each source table
-                for source_table, snapshot_id in dep_snapshots.items():
-                    if source_table not in snapshot_sources:
-                        snapshot_sources[source_table] = {}
-                    snapshot_sources[source_table][dep] = snapshot_id
-                
-                # Merge these snapshots
                 snapshots_to_use.update(dep_snapshots)
         
-        # Detect conflicts: source tables used by multiple dependencies with different snapshots
-        conflicting_deps: set[str] = set()
-        for source_table, dep_snapshots in snapshot_sources.items():
-            if len(dep_snapshots) > 1:
-                # Multiple dependencies use this source table
-                snapshot_values = list(dep_snapshots.values())
-                if len(set(snapshot_values)) > 1:
-                    # They used different snapshots - conflict!
-                    conflicting_deps.update(dep_snapshots.keys())
-        
-        # If we have conflicting dependencies, refresh them together first
-        if conflicting_deps and auto_commit:
-            # Refresh conflicting dependencies in a single transaction
-            # Capture snapshot ONCE for consistency
-            result = self.duckdb.execute("""
-                SELECT snapshot_id 
-                FROM ducklake.snapshots() 
-                ORDER BY snapshot_id DESC 
-                LIMIT 1
-            """).fetchone()
-            
-            conflict_batch_snapshot: int | None = int(result[0]) if result else None
-            
-            # Start a single transaction for all conflicting dependencies
-            self.duckdb.execute("BEGIN TRANSACTION")
-            
-            try:
-                for dep in sorted(conflicting_deps):  # Sort for determinism
-                    self.refresh_table(dep, auto_commit=False, batch_snapshot=conflict_batch_snapshot)
-                
-                # Commit all refreshes together
-                self.duckdb.execute("COMMIT")
-                self.metadata.conn.commit()
-                
-            except Exception:
-                # Rollback on failure, but don't hide the original exception
-                # if the rollback itself fails (e.g., transaction already rolled back)
-                try:
-                    self.duckdb.execute("ROLLBACK")
-                except Exception:
-                    # Ignore rollback errors - we want to raise the original exception
-                    pass
-                raise
-            
-            # Now re-collect snapshots from the freshly-refreshed dependencies
-            snapshots_to_use = {}
-            for dep in direct_dependencies:
-                cursor.execute(
-                    "SELECT name FROM dynamic_tables WHERE name = %s",
-                    (dep,)
-                )
-                is_dynamic_table = cursor.fetchone() is not None
-                
-                if is_dynamic_table:
-                    cursor.execute(
-                        """
-                        SELECT source_table, last_snapshot
-                        FROM source_snapshots
-                        WHERE dynamic_table = %s
-                    """,
-                        (dep,)
-                    )
-                    dep_snapshots = {row[0]: row[1] for row in cursor.fetchall()}
-                    snapshots_to_use.update(dep_snapshots)
-        
-        
-        # Second pass: capture current snapshot for any missing dependencies
-        # (including the direct dependencies themselves)
-        # If batch_snapshot is provided (refresh_all mode), use it for consistency
+        # Use batch_snapshot or capture current snapshot for missing dependencies
         current_snapshot: int | None
         if batch_snapshot is not None:
             current_snapshot = batch_snapshot
@@ -368,7 +282,6 @@ class DynamicTableRefresher:
 
         try:
             # Full refresh: TRUNCATE + INSERT
-            # First, create or truncate the table
             full_table_name = f"{schema_name}.{table_name}" if schema_name != "main" else table_name
 
             # Check if table exists
@@ -382,12 +295,8 @@ class DynamicTableRefresher:
             )
 
             if table_exists:
-                # Delete existing data (with transaction if auto_commit)
-                if auto_commit:
-                    self.duckdb.execute("BEGIN TRANSACTION")
+                # Delete existing data
                 self.duckdb.execute(f"DELETE FROM {full_table_name}")
-                if auto_commit:
-                    self.duckdb.execute("COMMIT")
             else:
                 # Create table from query (DDL - outside transaction)
                 # Use original query for schema inference, not snapshot query
@@ -398,16 +307,11 @@ class DynamicTableRefresher:
                     ) LIMIT 0
                 """)
 
-            # Insert data (DML - in transaction if auto_commit)
-            # Use snapshot-isolated query for actual data
-            if auto_commit:
-                self.duckdb.execute("BEGIN TRANSACTION")
+            # Insert data using snapshot-isolated query
             self.duckdb.execute(f"""
                 INSERT INTO {full_table_name}
                 {query_with_snapshots}
             """)
-            if auto_commit:
-                self.duckdb.execute("COMMIT")
 
             # Get row count
             rows_affected = self.duckdb.execute(
@@ -430,7 +334,7 @@ class DynamicTableRefresher:
                 (datetime.now(UTC), rows_affected, duration_ms, history_id),
             )
 
-            # Update source_snapshots table with the NEW snapshots we just captured
+            # Update source_snapshots table with the snapshots we used
             for source_table, snapshot_id in snapshots_to_use.items():
                 cursor.execute(
                     """
@@ -444,20 +348,9 @@ class DynamicTableRefresher:
                     (table_name, source_table, snapshot_id, datetime.now(UTC)),
                 )
 
-            if auto_commit:
-                self.metadata.conn.commit()
-
             return {"status": "SUCCESS", "rows_affected": rows_affected, "duration_ms": duration_ms}
 
         except Exception as e:
-            # Rollback transaction if it was started (only in auto_commit mode)
-            if auto_commit:
-                try:
-                    self.duckdb.execute("ROLLBACK")
-                except Exception:
-                    # Ignore rollback errors - we want to raise the original exception
-                    pass
-
             # Update history with error
             cursor.execute(
                 """
@@ -469,23 +362,113 @@ class DynamicTableRefresher:
             """,
                 (datetime.now(UTC), str(e), history_id),
             )
-
-            if auto_commit:
-                self.metadata.conn.commit()
             raise
+    
+    def _detect_conflicts(self, table_names: List[str]) -> set[str]:
+        """Detect dependencies with conflicting snapshots for the given tables.
+        
+        Args:
+            table_names: Tables to check for conflicts
+            
+        Returns:
+            Set of additional tables that need to be refreshed to resolve conflicts
+        """
+        cursor = self.metadata.conn.cursor()
+        conflicting_deps: set[str] = set()
+        
+        for table_name in table_names:
+            # Get direct dependencies
+            cursor.execute(
+                """
+                SELECT DISTINCT upstream
+                FROM dependencies
+                WHERE downstream = %s
+            """,
+                (table_name,),
+            )
+            
+            direct_dependencies = [row[0] for row in cursor.fetchall()]
+            
+            # Track which dependency used which snapshot for each source table
+            snapshot_sources: dict[str, dict[str, int]] = {}
+            
+            for dep in direct_dependencies:
+                # Check if this dependency is a dynamic table
+                cursor.execute(
+                    "SELECT name FROM dynamic_tables WHERE name = %s",
+                    (dep,)
+                )
+                is_dynamic_table = cursor.fetchone() is not None
+                
+                if is_dynamic_table:
+                    # Get the snapshots this dependency used
+                    cursor.execute(
+                        """
+                        SELECT source_table, last_snapshot
+                        FROM source_snapshots
+                        WHERE dynamic_table = %s
+                    """,
+                        (dep,)
+                    )
+                    dep_snapshots = {row[0]: row[1] for row in cursor.fetchall()}
+                    
+                    # Track which dependency used which snapshot for each source
+                    for source_table, snapshot_id in dep_snapshots.items():
+                        if source_table not in snapshot_sources:
+                            snapshot_sources[source_table] = {}
+                        snapshot_sources[source_table][dep] = snapshot_id
+            
+            # Detect conflicts: source tables used by multiple dependencies with different snapshots
+            for source_table, dep_snapshots in snapshot_sources.items():
+                if len(dep_snapshots) > 1:
+                    # Multiple dependencies use this source table
+                    snapshot_values = list(dep_snapshots.values())
+                    if len(set(snapshot_values)) > 1:
+                        # They used different snapshots - conflict!
+                        conflicting_deps.update(dep_snapshots.keys())
+        
+        return conflicting_deps
 
-    def refresh_all(self) -> List[Dict[str, Any]]:
-        """Refresh all dynamic tables in dependency order.
+    def refresh_tables(self, table_names: List[str] | None = None) -> List[Dict[str, Any]]:
+        """Refresh specified dynamic tables (or all if None) in dependency order.
         
         All tables are refreshed within a single DuckDB transaction to ensure
         they all see the same snapshot of base tables. This prevents inconsistencies
         when multiple dynamic tables depend on the same base table.
+        
+        If refreshing a specific subset of tables, automatically detects and includes
+        any dependencies that have conflicting snapshots and need to be refreshed together.
+
+        Args:
+            table_names: List of table names to refresh. If None, refreshes all tables.
 
         Returns:
             List of refresh results for each table
+            
+        Raises:
+            ValueError: If any specified table doesn't exist
         """
         graph = self._load_dependency_graph()
-        sorted_tables = graph.topological_sort()
+        all_sorted_tables = graph.topological_sort()
+        
+        # Filter to requested tables if specified
+        if table_names is not None:
+            # Validate that all requested tables exist
+            all_tables_set = set(all_sorted_tables)
+            for table in table_names:
+                if table not in all_tables_set:
+                    raise ValueError(f"Dynamic table '{table}' does not exist")
+            
+            # Detect and add conflicting dependencies
+            conflicting_deps = self._detect_conflicts(table_names)
+            
+            # Combine requested tables with conflicting dependencies
+            tables_to_refresh_set = set(table_names) | conflicting_deps
+            
+            # Keep topological order
+            tables_to_refresh = [t for t in all_sorted_tables if t in tables_to_refresh_set]
+        else:
+            tables_to_refresh = all_sorted_tables
 
         # Capture snapshot ONCE at the start of the batch
         # All tables will use this snapshot for base tables
@@ -504,8 +487,8 @@ class DynamicTableRefresher:
         self.duckdb.execute("BEGIN TRANSACTION")
         
         try:
-            for table_name in sorted_tables:
-                result = self.refresh_table(table_name, auto_commit=False, batch_snapshot=batch_snapshot)
+            for table_name in tables_to_refresh:
+                result = self._refresh_single_table(table_name, batch_snapshot=batch_snapshot)
                 result["table"] = table_name
                 results.append(result)
             

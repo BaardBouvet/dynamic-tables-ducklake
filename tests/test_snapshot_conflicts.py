@@ -49,7 +49,7 @@ class TestSnapshotConflicts:
         GROUP BY product_id
         """
         refresher.create_dynamic_table(DDLParser.parse(ddl_b))
-        refresher.refresh_table("order_summary_b")
+        refresher.refresh_tables(["order_summary_b"])
         
         # Add more data to A (creates new snapshot)
         duckdb_conn.execute("""
@@ -67,7 +67,7 @@ class TestSnapshotConflicts:
         GROUP BY product_id
         """
         refresher.create_dynamic_table(DDLParser.parse(ddl_c))
-        refresher.refresh_table("order_summary_c")
+        refresher.refresh_tables(["order_summary_c"])
         
         # Verify B and C used different snapshots of orders
         cursor = refresher.metadata.conn.cursor()
@@ -106,7 +106,7 @@ class TestSnapshotConflicts:
         
         # When we refresh D, it should detect the conflict and automatically
         # refresh B and C together first
-        refresher.refresh_table("order_validation")
+        refresher.refresh_tables(["order_validation"])
         
         # Verify that B and C now use the same snapshot of orders
         cursor.execute("""

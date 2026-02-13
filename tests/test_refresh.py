@@ -115,8 +115,8 @@ class TestDynamicTableRefresh:
         with pytest.raises(ValueError, match="Circular dependency"):
             refresher.create_dynamic_table(definition_b)
 
-    def test_refresh_table(self, refresher: Any, duckdb_conn: Any, sample_source_data: Any) -> None:
-        """Test full refresh of a table."""
+    def test_refresh_single_table(self, refresher: Any, duckdb_conn: Any, sample_source_data: Any) -> None:
+        """Test full refresh of a single table."""
         # Create dynamic table
         ddl = """
         CREATE DYNAMIC TABLE sales_summary
@@ -131,7 +131,7 @@ class TestDynamicTableRefresh:
         refresher.create_dynamic_table(definition)
 
         # Perform refresh
-        result = refresher.refresh_table("sales_summary")
+        result = refresher.refresh_tables(["sales_summary"])[0]
 
         assert result["status"] == "SUCCESS"
         assert result["rows_affected"] == 2  # 2 products
@@ -165,7 +165,7 @@ class TestDynamicTableRefresh:
         refresher.create_dynamic_table(definition)
 
         # First refresh
-        refresher.refresh_table("sales_summary")
+        refresher.refresh_tables(["sales_summary"])
 
         # Add more sales (with transaction)
         duckdb_conn.execute("BEGIN TRANSACTION")
@@ -175,7 +175,7 @@ class TestDynamicTableRefresh:
         duckdb_conn.execute("COMMIT")
 
         # Refresh again
-        result = refresher.refresh_table("sales_summary")
+        result = refresher.refresh_tables(["sales_summary"])[0]
 
         assert result["status"] == "SUCCESS"
 
@@ -192,9 +192,9 @@ class TestDynamicTableRefresh:
     def test_refresh_nonexistent_table(self, refresher: Any) -> None:
         """Test refreshing a table that doesn't exist."""
         with pytest.raises(ValueError, match="does not exist"):
-            refresher.refresh_table("nonexistent")
+            refresher.refresh_tables(["nonexistent"])
 
-    def test_refresh_all_in_dependency_order(
+    def test_refresh_tables_in_dependency_order(
         self, refresher: Any, duckdb_conn: Any, sample_source_data: Any
     ) -> None:
         """Test refreshing multiple tables in dependency order."""
@@ -222,8 +222,8 @@ class TestDynamicTableRefresh:
 
         refresher.create_dynamic_table(DDLParser.parse(ddl2))
 
-        # Refresh all
-        results = refresher.refresh_all()
+        # Refresh all tables
+        results = refresher.refresh_tables()
 
         assert len(results) == 2
 
@@ -258,7 +258,7 @@ class TestDynamicTableRefresh:
         """
 
         refresher.create_dynamic_table(DDLParser.parse(ddl))
-        refresher.refresh_table("sales_summary")
+        refresher.refresh_tables(["sales_summary"])
 
         # Drop the table
         refresher.drop_dynamic_table("sales_summary")
@@ -315,7 +315,7 @@ class TestDynamicTableRefresh:
         """
 
         refresher.create_dynamic_table(DDLParser.parse(ddl))
-        refresher.refresh_table("sales_summary")
+        refresher.refresh_tables(["sales_summary"])
 
         # Check history
         cursor = refresher.metadata.conn.cursor()
@@ -354,7 +354,7 @@ class TestDynamicTableRefresh:
         """
 
         refresher.create_dynamic_table(DDLParser.parse(ddl))
-        refresher.refresh_table("sales_summary")
+        refresher.refresh_tables(["sales_summary"])
 
         # Verify snapshots were captured in source_snapshots table
         cursor = refresher.metadata.conn.cursor()
@@ -400,7 +400,7 @@ class TestDynamicTableRefresh:
         """
 
         refresher.create_dynamic_table(DDLParser.parse(ddl1))
-        refresher.refresh_table("sales_summary")
+        refresher.refresh_tables(["sales_summary"])
 
         # Create second-level dynamic table that depends on sales_summary
         ddl2 = """
@@ -413,7 +413,7 @@ class TestDynamicTableRefresh:
         """
 
         refresher.create_dynamic_table(DDLParser.parse(ddl2))
-        refresher.refresh_table("high_value_products")
+        refresher.refresh_tables(["high_value_products"])
 
         # Verify that high_value_products has snapshots for both sales_summary and sales
         cursor = refresher.metadata.conn.cursor()
@@ -457,7 +457,7 @@ class TestDynamicTableRefresh:
         FROM orders
         """
         refresher.create_dynamic_table(DDLParser.parse(ddl_b))
-        refresher.refresh_table("order_summary")
+        refresher.refresh_tables(["order_summary"])
 
         # Verify B's results
         result_b = duckdb_conn.execute("SELECT order_count, total_amount FROM order_summary").fetchone()
@@ -486,7 +486,7 @@ class TestDynamicTableRefresh:
         
         # Refresh C - it should use the SAME snapshot of A that B used,
         # not the current state of A
-        refresher.refresh_table("order_validation")
+        refresher.refresh_tables(["order_validation"])
 
         # Verify C read A at the snapshot that B used (2 orders, 300 total)
         # NOT the current state (3 orders, 600 total)
